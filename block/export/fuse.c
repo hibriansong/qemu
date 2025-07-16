@@ -48,6 +48,11 @@
 #include <linux/fs.h>
 #endif
 
+#define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
+
+/* room needed in buffer to accommodate header */
+#define FUSE_BUFFER_HEADER_SIZE 0x1000
+
 /* Prevent overly long bounce buffer allocations */
 #define FUSE_MAX_READ_BYTES (MIN(BDRV_REQUEST_MAX_BYTES, 1 * 1024 * 1024))
 /*
@@ -64,6 +69,26 @@
 
 typedef struct FuseExport FuseExport;
 
+struct FuseQueue;
+
+typedef struct FuseRingEnt {
+    /* back pointer */
+    struct FuseQueue *q;
+
+    /* commit id of a fuse request */
+    uint64_t req_commit_id;
+
+    /* fuse request header and payload */
+    struct fuse_uring_req_header *req_header;
+    void *op_payload;
+    size_t req_payload_sz;
+
+    /* The vector passed to the kernel */
+    struct iovec iov[2];
+
+    CqeHandler fuse_cqe_handler;
+} FuseRingEnt;
+
 /*
  * One FUSE "queue", representing one FUSE FD from which requests are fetched
  * and processed.  Each queue is tied to an AioContext.
@@ -73,6 +98,7 @@ typedef struct FuseQueue {
 
     AioContext *ctx;
     int fuse_fd;
+    int qid;
 
     /*
      * The request buffer must be able to hold a full write, and/or at least
@@ -109,6 +135,17 @@ typedef struct FuseQueue {
      * Free this buffer with qemu_vfree().
      */
     void *spillover_buf;
+
+#ifdef CONFIG_LINUX_IO_URING
+    FuseRingEnt ent;
+
+    /*
+     * TODO
+     * Support multi-threaded FUSE over io_uring by using eventfd and allocating
+     * an extra SQE for each thread to be notified when the connection
+     * shuts down.
+     */
+#endif
 } FuseQueue;
 
 /*
@@ -148,6 +185,7 @@ struct FuseExport {
     bool growable;
     /* Whether allow_other was used as a mount option or not */
     bool allow_other;
+    bool is_uring;
 
     mode_t st_mode;
     uid_t st_uid;
@@ -257,6 +295,126 @@ static const BlockDevOps fuse_export_blk_dev_ops = {
     .drained_poll  = fuse_export_drained_poll,
 };
 
+#ifdef CONFIG_LINUX_IO_URING
+static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent);
+
+static void coroutine_fn co_fuse_uring_queue_handle_cqes(void *opaque)
+{
+    CqeHandler *cqe_handler = opaque;
+    FuseRingEnt *ent = container_of(cqe_handler, FuseRingEnt, fuse_cqe_handler);
+    FuseExport *exp = ent->q->exp;
+
+    fuse_uring_co_process_request(ent);
+
+    fuse_dec_in_flight(exp);
+}
+
+static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
+{
+    FuseRingEnt *ent = container_of(cqe_handler, FuseRingEnt, fuse_cqe_handler);
+    FuseQueue *q = ent->q;
+    Coroutine *co;
+    FuseExport *exp = ent->q->exp;
+
+    int err = cqe_handler->cqe.res;
+    if (err != 0) {
+        /* TODO end_conn support */
+
+        /* -ENOTCONN is ok on umount  */
+        if (err != -EINTR && err != -EOPNOTSUPP &&
+            err != -EAGAIN && err != -ENOTCONN) {
+            fuse_export_halt(exp);
+        }
+    } else {
+        co = qemu_coroutine_create(co_fuse_uring_queue_handle_cqes,
+                            cqe_handler);
+        /* Decremented by co_fuse_uring_queue_handle_cqes() */
+        fuse_inc_in_flight(q->exp);
+        qemu_coroutine_enter(co);
+    }
+}
+
+static void fuse_uring_sqe_set_req_data(struct fuse_uring_cmd_req *req,
+                    const unsigned int qid,
+                    const unsigned int commit_id)
+{
+    req->qid = qid;
+    req->commit_id = commit_id;
+    req->flags = 0;
+}
+
+static void fuse_uring_sqe_prepare(struct io_uring_sqe *sqe, FuseRingEnt *ent,
+               __u32 cmd_op)
+{
+    sqe->opcode = IORING_OP_URING_CMD;
+
+    sqe->fd = ent->q->fuse_fd;
+    sqe->rw_flags = 0;
+    sqe->ioprio = 0;
+    sqe->off = 0;
+
+    sqe->cmd_op = cmd_op;
+    sqe->__pad1 = 0;
+}
+
+static void fuse_uring_prep_sqe_register(struct io_uring_sqe *sqe, void *opaque)
+{
+    FuseQueue *q = opaque;
+    struct fuse_uring_cmd_req *req = (void *)&sqe->cmd[0];
+
+    fuse_uring_sqe_prepare(sqe, &q->ent, FUSE_IO_URING_CMD_REGISTER);
+
+    sqe->addr = (uint64_t)(q->ent.iov);
+    sqe->len = 2;
+
+    fuse_uring_sqe_set_req_data(req, q->qid, 0);
+}
+
+static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
+{
+    /*
+     * Since we didn't enable the FUSE_MAX_PAGES feature, the value of
+     * fc->max_pages should be FUSE_DEFAULT_MAX_PAGES_PER_REQ, which is set by
+     * the kernel by default. Also, max_write should not exceed
+     * FUSE_DEFAULT_MAX_PAGES_PER_REQ * PAGE_SIZE.
+     */
+    size_t bufsize = out->max_write + FUSE_BUFFER_HEADER_SIZE;
+
+    if (!(out->flags & FUSE_MAX_PAGES)) {
+        /*
+         * bufsize = MIN(FUSE_DEFAULT_MAX_PAGES_PER_REQ *
+         *       qemu_real_host_page_size() + FUSE_BUFFER_HEADER_SIZE, bufsize);
+         */
+        bufsize = FUSE_DEFAULT_MAX_PAGES_PER_REQ * qemu_real_host_page_size()
+                         + FUSE_BUFFER_HEADER_SIZE;
+    }
+
+    for (int i = 0; i < exp->num_queues; i++) {
+        FuseQueue *q = &exp->queues[i];
+
+        q->ent.q = q;
+
+        q->ent.req_header = g_malloc0(sizeof(struct fuse_uring_req_header));
+        q->ent.req_payload_sz = bufsize - FUSE_BUFFER_HEADER_SIZE;
+        q->ent.op_payload = g_malloc0(q->ent.req_payload_sz);
+
+        q->ent.iov[0] = (struct iovec) {
+            q->ent.req_header,
+            sizeof(struct fuse_uring_req_header)
+        };
+        q->ent.iov[1] = (struct iovec) {
+            q->ent.op_payload,
+            q->ent.req_payload_sz
+        };
+
+        exp->queues[i].ent.fuse_cqe_handler.cb = fuse_uring_cqe_handler;
+
+        aio_add_sqe(fuse_uring_prep_sqe_register, &(exp->queues[i]),
+            &(exp->queues[i].ent.fuse_cqe_handler));
+    }
+}
+#endif
+
 static int fuse_export_create(BlockExport *blk_exp,
                               BlockExportOptions *blk_exp_args,
                               AioContext *const *multithread,
@@ -280,6 +438,7 @@ static int fuse_export_create(BlockExport *blk_exp,
 
         for (size_t i = 0; i < mt_count; i++) {
             exp->queues[i] = (FuseQueue) {
+                .qid = i,
                 .exp = exp,
                 .ctx = multithread[i],
                 .fuse_fd = -1,
@@ -293,6 +452,7 @@ static int fuse_export_create(BlockExport *blk_exp,
         exp->num_queues = 1;
         exp->queues = g_new(FuseQueue, 1);
         exp->queues[0] = (FuseQueue) {
+            .qid = 0,
             .exp = exp,
             .ctx = exp->common.ctx,
             .fuse_fd = -1,
@@ -311,6 +471,8 @@ static int fuse_export_create(BlockExport *blk_exp,
             return ret;
         }
     }
+
+    exp->is_uring = args->uring ? true : false;
 
     blk_set_dev_ops(exp->common.blk, &fuse_export_blk_dev_ops, exp);
 
@@ -597,6 +759,22 @@ static void read_from_fuse_fd(void *opaque)
     qemu_coroutine_enter(co);
 }
 
+#ifdef CONFIG_LINUX_IO_URING
+static void fuse_export_delete_uring(FuseExport *exp)
+{
+    exp->is_uring = false;
+
+    /*
+     * TODO
+     * end_conn handling
+     */
+    for (size_t qid = 0; qid < exp->num_queues; qid++) {
+        g_free(exp->queues[qid].ent.req_header);
+        g_free(exp->queues[qid].ent.op_payload);
+    }
+}
+#endif
+
 static void fuse_export_shutdown(BlockExport *blk_exp)
 {
     FuseExport *exp = container_of(blk_exp, FuseExport, common);
@@ -617,6 +795,11 @@ static void fuse_export_shutdown(BlockExport *blk_exp)
 static void fuse_export_delete(BlockExport *blk_exp)
 {
     FuseExport *exp = container_of(blk_exp, FuseExport, common);
+
+#ifdef CONFIG_LINUX_IO_URING
+    if (exp->is_uring)
+        fuse_export_delete_uring(exp);
+#endif
 
     for (int i = 0; i < exp->num_queues; i++) {
         FuseQueue *q = &exp->queues[i];
@@ -687,15 +870,22 @@ static ssize_t coroutine_fn
 fuse_co_init(FuseExport *exp, struct fuse_init_out *out,
              uint32_t max_readahead, uint32_t flags)
 {
-    const uint32_t supported_flags = FUSE_ASYNC_READ | FUSE_ASYNC_DIO;
+    const uint32_t supported_flags = FUSE_ASYNC_READ | FUSE_ASYNC_DIO
+                                     | FUSE_INIT_EXT;
+    uint64_t outargflags = flags;
+
+#ifdef CONFIG_LINUX_IO_URING
+    if (exp->is_uring)
+        outargflags |= FUSE_OVER_IO_URING;
+#endif
 
     *out = (struct fuse_init_out) {
         .major = FUSE_KERNEL_VERSION,
         .minor = FUSE_KERNEL_MINOR_VERSION,
         .max_readahead = max_readahead,
         .max_write = FUSE_MAX_WRITE_BYTES,
-        .flags = flags & supported_flags,
-        .flags2 = 0,
+        .flags = outargflags & supported_flags,
+        .flags2 = outargflags >> 32,
 
         /* libfuse maximum: 2^16 - 1 */
         .max_background = UINT16_MAX,
@@ -943,6 +1133,9 @@ fuse_co_read(FuseExport *exp, void **bufptr, uint64_t offset, uint32_t size)
  * Data in @in_place_buf is assumed to be overwritten after yielding, so will
  * be copied to a bounce buffer beforehand.  @spillover_buf in contrast is
  * assumed to be exclusively owned and will be used as-is.
+ * In FUSE-over-io_uring mode, the actual op_payload content is stored in
+ * @spillover_buf. To ensure this buffer is used for writing, @in_place_buf
+ * is explicitly set to NULL.
  * Return the number of bytes written to *out on success, and -errno on error.
  */
 static ssize_t coroutine_fn
@@ -950,8 +1143,8 @@ fuse_co_write(FuseExport *exp, struct fuse_write_out *out,
               uint64_t offset, uint32_t size,
               const void *in_place_buf, const void *spillover_buf)
 {
-    size_t in_place_size;
-    void *copied;
+    size_t in_place_size = 0;
+    void *copied = NULL;
     int64_t blk_len;
     int ret;
     struct iovec iov[2];
@@ -966,10 +1159,12 @@ fuse_co_write(FuseExport *exp, struct fuse_write_out *out,
         return -EACCES;
     }
 
-    /* Must copy to bounce buffer before potentially yielding */
-    in_place_size = MIN(size, FUSE_IN_PLACE_WRITE_BYTES);
-    copied = blk_blockalign(exp->common.blk, in_place_size);
-    memcpy(copied, in_place_buf, in_place_size);
+    if (in_place_buf) {
+        /* Must copy to bounce buffer before potentially yielding */
+        in_place_size = MIN(size, FUSE_IN_PLACE_WRITE_BYTES);
+        copied = blk_blockalign(exp->common.blk, in_place_size);
+        memcpy(copied, in_place_buf, in_place_size);
+    }
 
     /**
      * Clients will expect short writes at EOF, so we have to limit
@@ -993,26 +1188,37 @@ fuse_co_write(FuseExport *exp, struct fuse_write_out *out,
         }
     }
 
-    iov[0] = (struct iovec) {
-        .iov_base = copied,
-        .iov_len = in_place_size,
-    };
-    if (size > FUSE_IN_PLACE_WRITE_BYTES) {
-        assert(size - FUSE_IN_PLACE_WRITE_BYTES <= FUSE_SPILLOVER_BUF_SIZE);
-        iov[1] = (struct iovec) {
-            .iov_base = (void *)spillover_buf,
-            .iov_len = size - FUSE_IN_PLACE_WRITE_BYTES,
+    if (in_place_buf) {
+        iov[0] = (struct iovec) {
+            .iov_base = copied,
+            .iov_len = in_place_size,
         };
-        qemu_iovec_init_external(&qiov, iov, 2);
+        if (size > FUSE_IN_PLACE_WRITE_BYTES) {
+            assert(size - FUSE_IN_PLACE_WRITE_BYTES <= FUSE_SPILLOVER_BUF_SIZE);
+            iov[1] = (struct iovec) {
+                .iov_base = (void *)spillover_buf,
+                .iov_len = size - FUSE_IN_PLACE_WRITE_BYTES,
+            };
+            qemu_iovec_init_external(&qiov, iov, 2);
+        } else {
+            qemu_iovec_init_external(&qiov, iov, 1);
+        }
     } else {
+        /* fuse over io_uring */
+        iov[0] = (struct iovec) {
+            .iov_base = (void *)spillover_buf,
+            .iov_len = size,
+        };
         qemu_iovec_init_external(&qiov, iov, 1);
     }
+
     ret = blk_co_pwritev(exp->common.blk, offset, size, &qiov, 0);
     if (ret < 0) {
         goto fail_free_buffer;
     }
 
-    qemu_vfree(copied);
+    if (in_place_buf)
+        qemu_vfree(copied);
 
     *out = (struct fuse_write_out) {
         .size = size,
@@ -1020,7 +1226,9 @@ fuse_co_write(FuseExport *exp, struct fuse_write_out *out,
     return sizeof(*out);
 
 fail_free_buffer:
-    qemu_vfree(copied);
+    if (in_place_buf) {
+        qemu_vfree(copied);
+    }
     return ret;
 }
 
@@ -1409,6 +1617,12 @@ fuse_co_process_request(FuseQueue *q, void *spillover_buf)
         const struct fuse_init_in *in = FUSE_IN_OP_STRUCT(init, q);
         ret = fuse_co_init(exp, FUSE_OUT_OP_STRUCT(init, out_buf),
                            in->max_readahead, in->flags);
+#ifdef CONFIG_LINUX_IO_URING
+        /* Set up fuse over io_uring after replying to the first FUSE_INIT */
+        if (exp->is_uring) {
+            fuse_uring_start(exp, FUSE_OUT_OP_STRUCT(init, out_buf));
+        }
+#endif
         break;
     }
 
@@ -1514,6 +1728,173 @@ fuse_co_process_request(FuseQueue *q, void *spillover_buf)
 
     qemu_vfree(spillover_buf);
 }
+
+#ifdef CONFIG_LINUX_IO_URING
+static void fuse_uring_prep_sqe_commit(struct io_uring_sqe *sqe, void *opaque)
+{
+    FuseRingEnt *ent = opaque;
+    struct fuse_uring_cmd_req *req = (void *)&sqe->cmd[0];
+
+    fuse_uring_sqe_prepare(sqe, ent, FUSE_IO_URING_CMD_COMMIT_AND_FETCH);
+    fuse_uring_sqe_set_req_data(req, ent->q->qid,
+                                     ent->req_commit_id);
+}
+
+static void
+fuse_uring_write_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
+                          const void *out_op_hdr, const void *buf)
+{
+    struct fuse_uring_req_header *rrh = ent->req_header;
+    struct fuse_out_header *out_header = (struct fuse_out_header *)&rrh->in_out;
+    struct fuse_uring_ent_in_out *ent_in_out =
+        (struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
+
+    if (buf) {
+        memcpy(ent->op_payload, buf, ret);
+    } else if (ret > 0) {
+        if (ret > ent->req_payload_sz) {
+            warn_report("data size %zu exceeds payload buffer size %zu",
+                        ret, ent->req_payload_sz);
+                        ret = -EINVAL;
+        } else {
+            memcpy(ent->op_payload, out_op_hdr, ret);
+        }
+    }
+
+    out_header->error  = ret < 0 ? ret : 0;
+    out_header->unique = req_id;
+    /* out_header->len = ret > 0 ? ret : 0; */
+    ent_in_out->payload_sz = ret > 0 ? ret : 0;
+
+    aio_add_sqe(fuse_uring_prep_sqe_commit, ent,
+                    &ent->fuse_cqe_handler);
+}
+
+static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
+{
+    FuseQueue *q = ent->q;
+    FuseExport *exp = q->exp;
+    struct fuse_uring_req_header *rrh = ent->req_header;
+    struct fuse_uring_ent_in_out *ent_in_out =
+        (struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
+
+    char out_op_hdr[MAX_CONST(sizeof(struct fuse_init_out),
+                 MAX_CONST(sizeof(struct fuse_open_out),
+                 MAX_CONST(sizeof(struct fuse_attr_out),
+                 MAX_CONST(sizeof(struct fuse_write_out),
+                           sizeof(struct fuse_lseek_out)))))];
+
+    void *out_data_buffer = NULL;
+
+    uint32_t opcode;
+    uint64_t req_id;
+
+    struct fuse_in_header *in_hdr = (struct fuse_in_header *)&rrh->in_out;
+    opcode = in_hdr->opcode;
+    req_id = in_hdr->unique;
+
+    ent->req_commit_id = ent_in_out->commit_id;
+
+    if (unlikely(ent->req_commit_id == 0)) {
+        /*
+         * If this happens kernel will not find the response - it will
+         * be stuck forever - better to abort immediately.
+         */
+        error_report("If this happens kernel will not find the response"
+        " - it will be stuck forever - better to abort immediately.");
+        fuse_export_halt(exp);
+        fuse_dec_in_flight(exp);
+        return;
+    }
+
+    ssize_t ret;
+
+    switch (opcode) {
+    case FUSE_OPEN:
+        ret = fuse_co_open(exp, (struct fuse_open_out *)out_op_hdr);
+        break;
+
+    case FUSE_RELEASE:
+        ret = 0;
+        break;
+
+    case FUSE_LOOKUP:
+        ret = -ENOENT; /* There is no node but the root node */
+        break;
+
+    case FUSE_GETATTR:
+        ret = fuse_co_getattr(exp, (struct fuse_attr_out *)out_op_hdr);
+        break;
+
+    case FUSE_SETATTR: {
+        const struct fuse_setattr_in *in =
+                        (const struct fuse_setattr_in *)&rrh->op_in;
+        ret = fuse_co_setattr(exp, (struct fuse_attr_out *)out_op_hdr,
+                              in->valid, in->size, in->mode, in->uid, in->gid);
+        break;
+    }
+
+    case FUSE_READ: {
+        const struct fuse_read_in *in =
+                        (const struct fuse_read_in *)&rrh->op_in;
+        ret = fuse_co_read(exp, &out_data_buffer, in->offset, in->size);
+        break;
+    }
+
+    case FUSE_WRITE: {
+        const struct fuse_write_in *in =
+                        (const struct fuse_write_in *)&rrh->op_in;
+
+        assert(in->size == ent_in_out->payload_sz);
+
+        /*
+         * poll_fuse_fd() has checked that in_hdr->len matches the number of
+         * bytes read, which cannot exceed the max_write value we set
+         * (FUSE_MAX_WRITE_BYTES).  So we know that FUSE_MAX_WRITE_BYTES >=
+         * in_hdr->len >= in->size + X, so this assertion must hold.
+         */
+        assert(in->size <= FUSE_MAX_WRITE_BYTES);
+
+        ret = fuse_co_write(exp, (struct fuse_write_out *)out_op_hdr,
+                            in->offset, in->size, NULL, ent->op_payload);
+        break;
+    }
+
+    case FUSE_FALLOCATE: {
+        const struct fuse_fallocate_in *in =
+                        (const struct fuse_fallocate_in *)&rrh->op_in;
+        ret = fuse_co_fallocate(exp, in->offset, in->length, in->mode);
+        break;
+    }
+
+    case FUSE_FSYNC:
+        ret = fuse_co_fsync(exp);
+        break;
+
+    case FUSE_FLUSH:
+        ret = fuse_co_flush(exp);
+        break;
+
+#ifdef CONFIG_FUSE_LSEEK
+    case FUSE_LSEEK: {
+        const struct fuse_lseek_in *in =
+                        (const struct fuse_lseek_in *)&rrh->op_in;
+        ret = fuse_co_lseek(exp, (struct fuse_lseek_out *)out_op_hdr,
+                            in->offset, in->whence);
+        break;
+    }
+#endif
+
+    default:
+        ret = -ENOSYS;
+    }
+
+    fuse_uring_write_response(ent, req_id, ret, out_op_hdr, out_data_buffer);
+
+    if (out_data_buffer)
+        qemu_vfree(out_data_buffer);
+}
+#endif
 
 const BlockExportDriver blk_exp_fuse = {
     .type               = BLOCK_EXPORT_TYPE_FUSE,
