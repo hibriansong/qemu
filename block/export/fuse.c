@@ -1564,127 +1564,137 @@ static int fuse_write_buf_response(int fd, uint32_t req_id,
         __out; \
     })
 
-/**
- * Process a FUSE request, incl. writing the response.
- *
- * Note that yielding in any request-processing function can overwrite the
- * contents of q->request_buf.  Anything that takes a buffer needs to take
- * care that the content is copied before yielding.
- *
- * @spillover_buf can contain the tail of a write request too large to fit into
- * q->request_buf.  This function takes ownership of it (i.e. will free it),
- * which assumes that its contents will not be overwritten by concurrent
- * requests (as opposed to q->request_buf).
+/*
+ * Shared helper for FUfSE request processing. Handles both legacy and io_uring
+ * paths.
  */
-static void coroutine_fn
-fuse_co_process_request(FuseQueue *q, void *spillover_buf)
+static void coroutine_fn fuse_co_process_request_common(
+    FuseExport *exp,
+    uint32_t opcode,
+    uint64_t req_id,
+    void *in_buf,
+    void *spillover_buf,
+    void *out_buf,
+    int fd, /* -1 for uring */
+    void (*send_response)(void *opaque, uint32_t req_id, ssize_t ret,
+                         const void *buf, void *out_buf),
+    void *opaque /* FuseQueue* or FuseRingEnt* */)
 {
-    FuseExport *exp = q->exp;
-    uint32_t opcode;
-    uint64_t req_id;
-    /*
-     * Return buffer.  Must be large enough to hold all return headers, but does
-     * not include space for data returned by read requests.
-     * (FUSE_IN_OP_STRUCT() verifies at compile time that out_buf is indeed
-     * large enough.)
-     */
-    char out_buf[sizeof(struct fuse_out_header) +
-                 MAX_CONST(sizeof(struct fuse_init_out),
-                 MAX_CONST(sizeof(struct fuse_open_out),
-                 MAX_CONST(sizeof(struct fuse_attr_out),
-                 MAX_CONST(sizeof(struct fuse_write_out),
-                           sizeof(struct fuse_lseek_out)))))];
-    struct fuse_out_header *out_hdr = (struct fuse_out_header *)out_buf;
-    /* For read requests: Data to be returned */
     void *out_data_buffer = NULL;
-    ssize_t ret;
+    ssize_t ret = 0;
 
-    /* Limit scope to ensure pointer is no longer used after yielding */
-    {
-        const struct fuse_in_header *in_hdr =
-            (const struct fuse_in_header *)q->request_buf;
-
-        opcode = in_hdr->opcode;
-        req_id = in_hdr->unique;
-    }
+    bool is_uring = exp->is_uring;
 
     switch (opcode) {
     case FUSE_INIT: {
-        const struct fuse_init_in *in = FUSE_IN_OP_STRUCT(init, q);
-        ret = fuse_co_init(exp, FUSE_OUT_OP_STRUCT(init, out_buf),
-                           in->max_readahead, in->flags);
+        const struct fuse_init_in *in = is_uring ?
+            (const struct fuse_init_in *)
+                &((FuseRingEnt *)opaque)->req_header.op_in :
+            (const struct fuse_init_in *)
+                (((struct fuse_in_header *)in_buf) + 1);
+
+        struct fuse_init_out *out = is_uring ?
+            (struct fuse_init_out *)out_buf :
+            (struct fuse_init_out *)((struct fuse_out_header *)out_buf + 1);
+
+        ret = fuse_co_init(exp, out, in->max_readahead, in->flags);
 #ifdef CONFIG_LINUX_IO_URING
-        /* Set up fuse over io_uring after replying to the first FUSE_INIT */
-        if (exp->is_uring) {
-            fuse_uring_start(exp, FUSE_OUT_OP_STRUCT(init, out_buf));
+        if (is_uring && fd == -1) {
+            fuse_uring_start(exp, out);
         }
 #endif
         break;
     }
 
-    case FUSE_OPEN:
-        ret = fuse_co_open(exp, FUSE_OUT_OP_STRUCT(open, out_buf));
+    case FUSE_OPEN: {
+        struct fuse_open_out *out = is_uring ?
+            (struct fuse_open_out *)out_buf :
+            (struct fuse_open_out *)((struct fuse_out_header *)out_buf + 1);
+
+        ret = fuse_co_open(exp, out);
         break;
+    }
 
     case FUSE_RELEASE:
         ret = 0;
         break;
 
     case FUSE_LOOKUP:
-        ret = -ENOENT; /* There is no node but the root node */
+        ret = -ENOENT;
         break;
 
-    case FUSE_GETATTR:
-        ret = fuse_co_getattr(exp, FUSE_OUT_OP_STRUCT(attr, out_buf));
+    case FUSE_GETATTR: {
+        struct fuse_attr_out *out = is_uring ?
+            (struct fuse_attr_out *)out_buf :
+            (struct fuse_attr_out *)((struct fuse_out_header *)out_buf + 1);
+
+        ret = fuse_co_getattr(exp, out);
         break;
+    }
 
     case FUSE_SETATTR: {
-        const struct fuse_setattr_in *in = FUSE_IN_OP_STRUCT(setattr, q);
-        ret = fuse_co_setattr(exp, FUSE_OUT_OP_STRUCT(attr, out_buf),
-                              in->valid, in->size, in->mode, in->uid, in->gid);
+        const struct fuse_setattr_in *in = is_uring ?
+            (const struct fuse_setattr_in *)
+                &((FuseRingEnt *)opaque)->req_header.op_in :
+            (const struct fuse_setattr_in *)
+                (((struct fuse_in_header *)in_buf) + 1);
+
+        struct fuse_attr_out *out = is_uring ?
+            (struct fuse_attr_out *)out_buf :
+            (struct fuse_attr_out *)((struct fuse_out_header *)out_buf + 1);
+
+        ret = fuse_co_setattr(exp, out, in->valid, in->size, in->mode,
+                              in->uid, in->gid);
         break;
     }
 
     case FUSE_READ: {
-        const struct fuse_read_in *in = FUSE_IN_OP_STRUCT(read, q);
+        const struct fuse_read_in *in = is_uring ?
+            (const struct fuse_read_in *)
+                &((FuseRingEnt *)opaque)->req_header.op_in :
+            (const struct fuse_read_in *)
+                (((struct fuse_in_header *)in_buf) + 1);
+
         ret = fuse_co_read(exp, &out_data_buffer, in->offset, in->size);
         break;
     }
 
     case FUSE_WRITE: {
-        const struct fuse_write_in *in = FUSE_IN_OP_STRUCT(write, q);
-        uint32_t req_len;
+        const struct fuse_write_in *in =
+            (const struct fuse_write_in *)((struct fuse_in_header *)in_buf + 1);
 
-        req_len = ((const struct fuse_in_header *)q->request_buf)->len;
+        struct fuse_write_out *out = is_uring ?
+            (struct fuse_write_out *)out_buf :
+            (struct fuse_write_out *)((struct fuse_out_header *)out_buf + 1);
+        uint32_t req_len = ((const struct fuse_in_header *)in_buf)->len;
+
         if (unlikely(req_len < sizeof(struct fuse_in_header) + sizeof(*in) +
-                               in->size)) {
+                     in->size)) {
             warn_report("FUSE WRITE truncated; received %zu bytes of %" PRIu32,
-                        req_len - sizeof(struct fuse_in_header) - sizeof(*in),
-                        in->size);
+                req_len - sizeof(struct fuse_in_header) - sizeof(*in),
+                in->size);
             ret = -EINVAL;
             break;
         }
 
-        /*
-         * poll_fuse_fd() has checked that in_hdr->len matches the number of
-         * bytes read, which cannot exceed the max_write value we set
-         * (FUSE_MAX_WRITE_BYTES).  So we know that FUSE_MAX_WRITE_BYTES >=
-         * in_hdr->len >= in->size + X, so this assertion must hold.
-         */
         assert(in->size <= FUSE_MAX_WRITE_BYTES);
 
-        /*
-         * Passing a pointer to `in` (i.e. the request buffer) is fine because
-         * fuse_co_write() takes care to copy its contents before potentially
-         * yielding.
-         */
-        ret = fuse_co_write(exp, FUSE_OUT_OP_STRUCT(write, out_buf),
-                            in->offset, in->size, in + 1, spillover_buf);
+        const void *in_place_buf = is_uring ? NULL : (in + 1);
+        const void *spill_buf = is_uring ?
+            ((FuseRingEnt *)opaque)->op_payload : spillover_buf;
+
+        ret = fuse_co_write(exp, out, in->offset, in->size,
+                            in_place_buf, spill_buf);
         break;
     }
 
     case FUSE_FALLOCATE: {
-        const struct fuse_fallocate_in *in = FUSE_IN_OP_STRUCT(fallocate, q);
+        const struct fuse_fallocate_in *in = is_uring ?
+            (const struct fuse_fallocate_in *)
+                &((FuseRingEnt *)opaque)->req_header.op_in :
+            (const struct fuse_fallocate_in *)
+                (((struct fuse_in_header *)in_buf) + 1);
+
         ret = fuse_co_fallocate(exp, in->offset, in->length, in->mode);
         break;
     }
@@ -1699,9 +1709,17 @@ fuse_co_process_request(FuseQueue *q, void *spillover_buf)
 
 #ifdef CONFIG_FUSE_LSEEK
     case FUSE_LSEEK: {
-        const struct fuse_lseek_in *in = FUSE_IN_OP_STRUCT(lseek, q);
-        ret = fuse_co_lseek(exp, FUSE_OUT_OP_STRUCT(lseek, out_buf),
-                            in->offset, in->whence);
+        const struct fuse_lseek_in *in = is_uring ?
+            (const struct fuse_lseek_in *)
+                &((FuseRingEnt *)opaque)->req_header.op_in :
+            (const struct fuse_lseek_in *)
+                (((struct fuse_in_header *)in_buf) + 1);
+
+        struct fuse_lseek_out *out = is_uring ?
+            (struct fuse_lseek_out *)out_buf :
+            (struct fuse_lseek_out *)((struct fuse_out_header *)out_buf + 1);
+
+        ret = fuse_co_lseek(exp, out, in->offset, in->whence);
         break;
     }
 #endif
@@ -1710,19 +1728,64 @@ fuse_co_process_request(FuseQueue *q, void *spillover_buf)
         ret = -ENOSYS;
     }
 
-    /* Ignore errors from fuse_write*(), nothing we can do anyway */
+    send_response(opaque, req_id, ret, out_data_buffer, out_buf);
+
     if (out_data_buffer) {
-        assert(ret >= 0);
-        fuse_write_buf_response(q->fuse_fd, req_id, out_hdr,
-                                out_data_buffer, ret);
         qemu_vfree(out_data_buffer);
+    }
+
+    if (fd != -1) {
+        qemu_vfree(spillover_buf);
+    }
+}
+
+/* Helper to send response for legacy */
+static void send_response_legacy(void *opaque, uint32_t req_id, ssize_t ret,
+                            const void *buf, void *out_buf)
+{
+    FuseQueue *q = (FuseQueue *)opaque;
+    struct fuse_out_header *out_hdr = (struct fuse_out_header *)out_buf;
+    if (buf) {
+        assert(ret >= 0);
+        fuse_write_buf_response(q->fuse_fd, req_id, out_hdr, buf, ret);
     } else {
         fuse_write_response(q->fuse_fd, req_id, out_hdr,
                             ret < 0 ? ret : 0,
                             ret < 0 ? 0 : ret);
     }
+}
 
-    qemu_vfree(spillover_buf);
+static void coroutine_fn
+fuse_co_process_request(FuseQueue *q, void *spillover_buf)
+{
+    FuseExport *exp = q->exp;
+    uint32_t opcode;
+    uint64_t req_id;
+
+    /*
+     * Return buffer.  Must be large enough to hold all return headers, but does
+     * not include space for data returned by read requests.
+     * (FUSE_IN_OP_STRUCT() verifies at compile time that out_buf is indeed
+     * large enough.)
+     */
+    char out_buf[sizeof(struct fuse_out_header) +
+        MAX_CONST(sizeof(struct fuse_init_out),
+        MAX_CONST(sizeof(struct fuse_open_out),
+        MAX_CONST(sizeof(struct fuse_attr_out),
+        MAX_CONST(sizeof(struct fuse_write_out),
+                  sizeof(struct fuse_lseek_out)))))] = {0};
+
+    /* Limit scope to ensure pointer is no longer used after yielding */
+    {
+        const struct fuse_in_header *in_hdr =
+            (const struct fuse_in_header *)q->request_buf;
+
+        opcode = in_hdr->opcode;
+        req_id = in_hdr->unique;
+    }
+
+    fuse_co_process_request_common(exp, opcode, req_id, q->request_buf,
+        spillover_buf, out_buf, q->fuse_fd, send_response_legacy, q);
 }
 
 #ifdef CONFIG_LINUX_IO_URING
@@ -1737,7 +1800,7 @@ static void fuse_uring_prep_sqe_commit(struct io_uring_sqe *sqe, void *opaque)
 }
 
 static void
-fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret, 
+fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
                          const void *buf)
 {
     struct fuse_uring_req_header *rrh = &ent->req_header;
@@ -1759,6 +1822,14 @@ fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
                     &ent->fuse_cqe_handler);
 }
 
+/* Helper to send response for uring */
+static void send_response_uring(void *opaque, uint32_t req_id, ssize_t ret,
+                        const void *buf, void *out_buf)
+{
+    FuseRingEnt *ent = (FuseRingEnt *)opaque;
+    fuse_uring_send_response(ent, req_id, ret, buf);
+}
+
 static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
 {
     FuseQueue *q = ent->q;
@@ -1766,125 +1837,21 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
     struct fuse_uring_req_header *rrh = &ent->req_header;
     struct fuse_uring_ent_in_out *ent_in_out =
         (struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
-
-    /* 
-     * The payload inside ent carries either the operation out headers or the 
-     * file data to be written or read.
-     */
-    char *out_op_hdr = ent->op_payload;
-
-    void *out_data_buffer = NULL;
-
-    uint32_t opcode;
-    uint64_t req_id;
-
-    struct fuse_in_header *in_hdr = (struct fuse_in_header *)&rrh->in_out;
-    opcode = in_hdr->opcode;
-    req_id = in_hdr->unique;
-
+    struct fuse_in_header *in_hdr =
+        (struct fuse_in_header *)&rrh->in_out;
+    uint32_t opcode = in_hdr->opcode;
+    uint64_t req_id = in_hdr->unique;
     ent->req_commit_id = ent_in_out->commit_id;
 
     if (unlikely(ent->req_commit_id == 0)) {
-        /*
-         * If this happens kernel will not find the response - it will
-         * be stuck forever - better to abort immediately.
-         */
-        error_report("If this happens kernel will not find the response"
-        " - it will be stuck forever - better to abort immediately.");
+        error_report("If this happens kernel will not find the response - "
+            "it will be stuck forever - better to abort immediately.");
         fuse_export_halt(exp);
-        fuse_dec_in_flight(exp);
         return;
     }
 
-    ssize_t ret;
-
-    switch (opcode) {
-    case FUSE_OPEN:
-        ret = fuse_co_open(exp, (struct fuse_open_out *)out_op_hdr);
-        break;
-
-    case FUSE_RELEASE:
-        ret = 0;
-        break;
-
-    case FUSE_LOOKUP:
-        ret = -ENOENT; /* There is no node but the root node */
-        break;
-
-    case FUSE_GETATTR:
-        ret = fuse_co_getattr(exp, (struct fuse_attr_out *)out_op_hdr);
-        break;
-
-    case FUSE_SETATTR: {
-        const struct fuse_setattr_in *in =
-                        (const struct fuse_setattr_in *)&rrh->op_in;
-        ret = fuse_co_setattr(exp, (struct fuse_attr_out *)out_op_hdr,
-                              in->valid, in->size, in->mode, in->uid, in->gid);
-        break;
-    }
-
-    case FUSE_READ: {
-        const struct fuse_read_in *in =
-                        (const struct fuse_read_in *)&rrh->op_in;
-        ret = fuse_co_read(exp, &out_data_buffer, in->offset, in->size);
-        out_op_hdr = NULL;
-        break;
-    }
-
-    case FUSE_WRITE: {
-        const struct fuse_write_in *in =
-                        (const struct fuse_write_in *)&rrh->op_in;
-
-        char *buf_to_be_written = ent->op_payload;
-
-        assert(in->size == ent_in_out->payload_sz);
-
-        /*
-         * poll_fuse_fd() has checked that in_hdr->len matches the number of
-         * bytes read, which cannot exceed the max_write value we set
-         * (FUSE_MAX_WRITE_BYTES).  So we know that FUSE_MAX_WRITE_BYTES >=
-         * in_hdr->len >= in->size + X, so this assertion must hold.
-         */
-        assert(in->size <= FUSE_MAX_WRITE_BYTES);
-
-        ret = fuse_co_write(exp, (struct fuse_write_out *)out_op_hdr,
-                            in->offset, in->size, NULL, buf_to_be_written);
-        break;
-    }
-
-    case FUSE_FALLOCATE: {
-        const struct fuse_fallocate_in *in =
-                        (const struct fuse_fallocate_in *)&rrh->op_in;
-        ret = fuse_co_fallocate(exp, in->offset, in->length, in->mode);
-        break;
-    }
-
-    case FUSE_FSYNC:
-        ret = fuse_co_fsync(exp);
-        break;
-
-    case FUSE_FLUSH:
-        ret = fuse_co_flush(exp);
-        break;
-
-#ifdef CONFIG_FUSE_LSEEK
-    case FUSE_LSEEK: {
-        const struct fuse_lseek_in *in =
-                        (const struct fuse_lseek_in *)&rrh->op_in;
-        ret = fuse_co_lseek(exp, (struct fuse_lseek_out *)out_op_hdr,
-                            in->offset, in->whence);
-        break;
-    }
-#endif
-
-    default:
-        ret = -ENOSYS;
-    }
-
-    fuse_uring_send_response(ent, req_id, ret, out_data_buffer);
-
-    if (out_data_buffer)
-        qemu_vfree(out_data_buffer);
+    fuse_co_process_request_common(exp, opcode, req_id, &ent->req_header.in_out,
+        NULL, ent->op_payload, -1, send_response_uring, ent);
 }
 #endif
 
