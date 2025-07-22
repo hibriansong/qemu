@@ -68,18 +68,17 @@
     (FUSE_MAX_WRITE_BYTES - FUSE_IN_PLACE_WRITE_BYTES)
 
 typedef struct FuseExport FuseExport;
-
-struct FuseQueue;
+typedef struct FuseQueue FuseQueue;
 
 typedef struct FuseRingEnt {
     /* back pointer */
-    struct FuseQueue *q;
+    FuseQueue *q;
 
     /* commit id of a fuse request */
     uint64_t req_commit_id;
 
     /* fuse request header and payload */
-    struct fuse_uring_req_header *req_header;
+    struct fuse_uring_req_header req_header;
     void *op_payload;
     size_t req_payload_sz;
 
@@ -93,12 +92,11 @@ typedef struct FuseRingEnt {
  * One FUSE "queue", representing one FUSE FD from which requests are fetched
  * and processed.  Each queue is tied to an AioContext.
  */
-typedef struct FuseQueue {
+struct FuseQueue {
     FuseExport *exp;
 
     AioContext *ctx;
     int fuse_fd;
-    int qid;
 
     /*
      * The request buffer must be able to hold a full write, and/or at least
@@ -137,6 +135,7 @@ typedef struct FuseQueue {
     void *spillover_buf;
 
 #ifdef CONFIG_LINUX_IO_URING
+    int qid;
     FuseRingEnt ent;
 
     /*
@@ -146,7 +145,7 @@ typedef struct FuseQueue {
      * shuts down.
      */
 #endif
-} FuseQueue;
+};
 
 /*
  * Verify that FuseQueue.request_buf plus the spill-over buffer together
@@ -300,19 +299,17 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent);
 
 static void coroutine_fn co_fuse_uring_queue_handle_cqes(void *opaque)
 {
-    CqeHandler *cqe_handler = opaque;
-    FuseRingEnt *ent = container_of(cqe_handler, FuseRingEnt, fuse_cqe_handler);
+    FuseRingEnt *ent = opaque;
     FuseExport *exp = ent->q->exp;
 
+    fuse_inc_in_flight(exp);
     fuse_uring_co_process_request(ent);
-
     fuse_dec_in_flight(exp);
 }
 
 static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
 {
     FuseRingEnt *ent = container_of(cqe_handler, FuseRingEnt, fuse_cqe_handler);
-    FuseQueue *q = ent->q;
     Coroutine *co;
     FuseExport *exp = ent->q->exp;
 
@@ -326,10 +323,7 @@ static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
             fuse_export_halt(exp);
         }
     } else {
-        co = qemu_coroutine_create(co_fuse_uring_queue_handle_cqes,
-                            cqe_handler);
-        /* Decremented by co_fuse_uring_queue_handle_cqes() */
-        fuse_inc_in_flight(q->exp);
+        co = qemu_coroutine_create(co_fuse_uring_queue_handle_cqes, ent);
         qemu_coroutine_enter(co);
     }
 }
@@ -394,12 +388,11 @@ static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
 
         q->ent.q = q;
 
-        q->ent.req_header = g_malloc0(sizeof(struct fuse_uring_req_header));
         q->ent.req_payload_sz = bufsize - FUSE_BUFFER_HEADER_SIZE;
         q->ent.op_payload = g_malloc0(q->ent.req_payload_sz);
 
         q->ent.iov[0] = (struct iovec) {
-            q->ent.req_header,
+            &(q->ent.req_header),
             sizeof(struct fuse_uring_req_header)
         };
         q->ent.iov[1] = (struct iovec) {
@@ -438,7 +431,9 @@ static int fuse_export_create(BlockExport *blk_exp,
 
         for (size_t i = 0; i < mt_count; i++) {
             exp->queues[i] = (FuseQueue) {
+#ifdef CONFIG_LINUX_IO_URING
                 .qid = i,
+#endif
                 .exp = exp,
                 .ctx = multithread[i],
                 .fuse_fd = -1,
@@ -452,7 +447,9 @@ static int fuse_export_create(BlockExport *blk_exp,
         exp->num_queues = 1;
         exp->queues = g_new(FuseQueue, 1);
         exp->queues[0] = (FuseQueue) {
+#ifdef CONFIG_LINUX_IO_URING
             .qid = 0,
+#endif
             .exp = exp,
             .ctx = exp->common.ctx,
             .fuse_fd = -1,
@@ -472,7 +469,7 @@ static int fuse_export_create(BlockExport *blk_exp,
         }
     }
 
-    exp->is_uring = args->uring ? true : false;
+    exp->is_uring = args->io_uring ? true : false;
 
     blk_set_dev_ops(exp->common.blk, &fuse_export_blk_dev_ops, exp);
 
@@ -769,7 +766,6 @@ static void fuse_export_delete_uring(FuseExport *exp)
      * end_conn handling
      */
     for (size_t qid = 0; qid < exp->num_queues; qid++) {
-        g_free(exp->queues[qid].ent.req_header);
         g_free(exp->queues[qid].ent.op_payload);
     }
 }
@@ -1741,24 +1737,17 @@ static void fuse_uring_prep_sqe_commit(struct io_uring_sqe *sqe, void *opaque)
 }
 
 static void
-fuse_uring_write_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
-                          const void *out_op_hdr, const void *buf)
+fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret, 
+                         const void *buf)
 {
-    struct fuse_uring_req_header *rrh = ent->req_header;
+    struct fuse_uring_req_header *rrh = &ent->req_header;
     struct fuse_out_header *out_header = (struct fuse_out_header *)&rrh->in_out;
     struct fuse_uring_ent_in_out *ent_in_out =
         (struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
 
-    if (buf) {
+    /* FUSE_READ */
+    if (buf && ret > 0) {
         memcpy(ent->op_payload, buf, ret);
-    } else if (ret > 0) {
-        if (ret > ent->req_payload_sz) {
-            warn_report("data size %zu exceeds payload buffer size %zu",
-                        ret, ent->req_payload_sz);
-                        ret = -EINVAL;
-        } else {
-            memcpy(ent->op_payload, out_op_hdr, ret);
-        }
     }
 
     out_header->error  = ret < 0 ? ret : 0;
@@ -1774,15 +1763,15 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
 {
     FuseQueue *q = ent->q;
     FuseExport *exp = q->exp;
-    struct fuse_uring_req_header *rrh = ent->req_header;
+    struct fuse_uring_req_header *rrh = &ent->req_header;
     struct fuse_uring_ent_in_out *ent_in_out =
         (struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
 
-    char out_op_hdr[MAX_CONST(sizeof(struct fuse_init_out),
-                 MAX_CONST(sizeof(struct fuse_open_out),
-                 MAX_CONST(sizeof(struct fuse_attr_out),
-                 MAX_CONST(sizeof(struct fuse_write_out),
-                           sizeof(struct fuse_lseek_out)))))];
+    /* 
+     * The payload inside ent carries either the operation out headers or the 
+     * file data to be written or read.
+     */
+    char *out_op_hdr = ent->op_payload;
 
     void *out_data_buffer = NULL;
 
@@ -1838,12 +1827,15 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
         const struct fuse_read_in *in =
                         (const struct fuse_read_in *)&rrh->op_in;
         ret = fuse_co_read(exp, &out_data_buffer, in->offset, in->size);
+        out_op_hdr = NULL;
         break;
     }
 
     case FUSE_WRITE: {
         const struct fuse_write_in *in =
                         (const struct fuse_write_in *)&rrh->op_in;
+
+        char *buf_to_be_written = ent->op_payload;
 
         assert(in->size == ent_in_out->payload_sz);
 
@@ -1856,7 +1848,7 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
         assert(in->size <= FUSE_MAX_WRITE_BYTES);
 
         ret = fuse_co_write(exp, (struct fuse_write_out *)out_op_hdr,
-                            in->offset, in->size, NULL, ent->op_payload);
+                            in->offset, in->size, NULL, buf_to_be_written);
         break;
     }
 
@@ -1889,7 +1881,7 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
         ret = -ENOSYS;
     }
 
-    fuse_uring_write_response(ent, req_id, ret, out_op_hdr, out_data_buffer);
+    fuse_uring_send_response(ent, req_id, ret, out_data_buffer);
 
     if (out_data_buffer)
         qemu_vfree(out_data_buffer);
