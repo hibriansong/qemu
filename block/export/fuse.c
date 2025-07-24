@@ -1665,22 +1665,26 @@ static void coroutine_fn fuse_co_process_request_common(
         struct fuse_write_out *out = is_uring ?
             (struct fuse_write_out *)out_buf :
             (struct fuse_write_out *)((struct fuse_out_header *)out_buf + 1);
+
         uint32_t req_len = ((const struct fuse_in_header *)in_buf)->len;
 
-        if (unlikely(req_len < sizeof(struct fuse_in_header) + sizeof(*in) +
-                     in->size)) {
-            warn_report("FUSE WRITE truncated; received %zu bytes of %" PRIu32,
-                req_len - sizeof(struct fuse_in_header) - sizeof(*in),
-                in->size);
-            ret = -EINVAL;
-            break;
+        if (!is_uring) {
+            if (unlikely(req_len < sizeof(struct fuse_in_header) + sizeof(*in) +
+                        in->size)) {
+                warn_report("FUSE WRITE truncated; received %zu bytes of %" PRIu32,
+                    req_len - sizeof(struct fuse_in_header) - sizeof(*in),
+                    in->size);
+                ret = -EINVAL;
+                break;
+            }
+        } else {
+            assert(in->size <= ((FuseRingEnt *)opaque)->req_header.ring_ent_in_out.payload_sz);
         }
 
         assert(in->size <= FUSE_MAX_WRITE_BYTES);
 
         const void *in_place_buf = is_uring ? NULL : (in + 1);
-        const void *spill_buf = is_uring ?
-            ((FuseRingEnt *)opaque)->op_payload : spillover_buf;
+        const void *spill_buf = is_uring ? out_buf : spillover_buf;
 
         ret = fuse_co_write(exp, out, in->offset, in->size,
                             in_place_buf, spill_buf);
