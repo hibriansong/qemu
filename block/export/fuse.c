@@ -1578,12 +1578,11 @@ static void coroutine_fn fuse_co_process_request_common(
     int fd, /* -1 for uring */
     void (*send_response)(void *opaque, uint32_t req_id, ssize_t ret,
                          const void *buf, void *out_buf),
-    void *opaque /* FuseQueue* or FuseRingEnt* */)
+    void *opaque, /* FuseQueue* or FuseRingEnt* */
+    bool is_uring)
 {
     void *out_data_buffer = NULL;
     ssize_t ret = 0;
-
-    bool is_uring = exp->is_uring;
 
     switch (opcode) {
     case FUSE_INIT: {
@@ -1599,7 +1598,7 @@ static void coroutine_fn fuse_co_process_request_common(
 
         ret = fuse_co_init(exp, out, in->max_readahead, in->flags);
 #ifdef CONFIG_LINUX_IO_URING
-        if (is_uring && fd == -1) {
+        if (exp->is_uring && fd == -1) {
             fuse_uring_start(exp, out);
         }
 #endif
@@ -1785,7 +1784,7 @@ fuse_co_process_request(FuseQueue *q, void *spillover_buf)
     }
 
     fuse_co_process_request_common(exp, opcode, req_id, q->request_buf,
-        spillover_buf, out_buf, q->fuse_fd, send_response_legacy, q);
+        spillover_buf, out_buf, q->fuse_fd, send_response_legacy, q, false);
 }
 
 #ifdef CONFIG_LINUX_IO_URING
@@ -1851,7 +1850,7 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
     }
 
     fuse_co_process_request_common(exp, opcode, req_id, &ent->req_header.in_out,
-        NULL, ent->op_payload, -1, send_response_uring, ent);
+        NULL, ent->op_payload, -1, send_response_uring, ent, true);
 }
 #endif
 
