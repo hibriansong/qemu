@@ -366,7 +366,6 @@ static void fuse_uring_prep_sqe_register(struct io_uring_sqe *sqe, void *opaque)
 
 static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
 {
-    printf("IO_URING ENABLED\n");
     /*
      * Since we didn't enable the FUSE_MAX_PAGES feature, the value of
      * fc->max_pages should be FUSE_DEFAULT_MAX_PAGES_PER_REQ, which is set by
@@ -385,7 +384,6 @@ static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
     }
 
     for (int i = 0; i < exp->num_queues; i++) {
-        printf("QUEUE INTI\n");
         FuseQueue *q = &exp->queues[i];
 
         q->ent.q = q;
@@ -403,7 +401,6 @@ static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
         };
 
         exp->queues[i].ent.fuse_cqe_handler.cb = fuse_uring_cqe_handler;
-        fprintf(stderr, "\n===== io_uring fd: %d ==========\n", q->ctx->fdmon_io_uring.ring_fd);
 
         aio_add_sqe(fuse_uring_prep_sqe_register, &(exp->queues[i]),
             &(exp->queues[i].ent.fuse_cqe_handler));
@@ -472,7 +469,8 @@ static int fuse_export_create(BlockExport *blk_exp,
         }
     }
 
-    exp->is_uring = args->io_uring ? true : false;
+    // exp->is_uring = args->io_uring ? true : false;
+    exp->is_uring = true;
 
     blk_set_dev_ops(exp->common.blk, &fuse_export_blk_dev_ops, exp);
 
@@ -1115,7 +1113,6 @@ fuse_co_read(FuseExport *exp, void **bufptr, uint64_t offset, uint32_t size)
         return -ENOMEM;
     }
 
-    printf("=== read ===\n");
     ret = blk_co_pread(exp->common.blk, offset, size, buf, 0);
     if (ret < 0) {
         qemu_vfree(buf);
@@ -1160,7 +1157,6 @@ fuse_co_write(FuseExport *exp, struct fuse_write_out *out,
     }
 
     if (in_place_buf) {
-        printf("traditional: copy in_place_buf\n");
         /* Must copy to bounce buffer before potentially yielding */
         in_place_size = MIN(size, FUSE_IN_PLACE_WRITE_BYTES);
         copied = blk_blockalign(exp->common.blk, in_place_size);
@@ -1205,7 +1201,6 @@ fuse_co_write(FuseExport *exp, struct fuse_write_out *out,
             qemu_iovec_init_external(&qiov, iov, 1);
         }
     } else {
-        printf("uring: prep write iov\n");
         /* fuse over io_uring */
         iov[0] = (struct iovec) {
             .iov_base = (void *)spillover_buf,
@@ -1584,11 +1579,12 @@ static void coroutine_fn fuse_co_process_request_common(
     int fd, /* -1 for uring */
     void (*send_response)(void *opaque, uint32_t req_id, ssize_t ret,
                          const void *buf, void *out_buf),
-    void *opaque, /* FuseQueue* or FuseRingEnt* */
-    bool is_uring)
+    void *opaque, /* FuseQueue* or FuseRingEnt* */)
 {
     void *out_data_buffer = NULL;
     ssize_t ret = 0;
+
+    bool is_uring = exp->is_uring;
 
     switch (opcode) {
     case FUSE_INIT: {
@@ -1681,7 +1677,6 @@ static void coroutine_fn fuse_co_process_request_common(
                 break;
             }
         } else {
-            printf("=== out_buf: %p ===\n", out_buf);
             assert(in->size <= ((FuseRingEnt *)opaque)->req_header.ring_ent_in_out.payload_sz);
         }
 
@@ -1790,7 +1785,7 @@ fuse_co_process_request(FuseQueue *q, void *spillover_buf)
     }
 
     fuse_co_process_request_common(exp, opcode, req_id, q->request_buf,
-        spillover_buf, out_buf, q->fuse_fd, send_response_legacy, q, false);
+        spillover_buf, out_buf, q->fuse_fd, send_response_legacy, q);
 }
 
 #ifdef CONFIG_LINUX_IO_URING
@@ -1855,8 +1850,8 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
         return;
     }
 
-    fuse_co_process_request_common(exp, opcode, req_id, &ent->req_header.in_out,
-        NULL, ent->op_payload, -1, send_response_uring, ent, true);
+    fuse_co_process_request_common(exp, opcode, req_id, &rrh->op_in,
+        NULL, ent->op_payload, -1, send_response_uring, ent);
 }
 #endif
 
