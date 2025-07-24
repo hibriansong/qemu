@@ -1601,7 +1601,8 @@ static void coroutine_fn fuse_co_process_request_common(
 
         ret = fuse_co_init(exp, out, in->max_readahead, in->flags);
 #ifdef CONFIG_LINUX_IO_URING
-        if (exp->is_uring && fd == -1) {
+        /* FUSE-over-io_uring enabled && start from the tradition path */
+        if (exp->is_uring && fd != -1) {
             fuse_uring_start(exp, out);
         }
 #endif
