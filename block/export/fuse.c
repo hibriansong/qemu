@@ -366,7 +366,7 @@ static void fuse_uring_prep_sqe_register(struct io_uring_sqe *sqe, void *opaque)
 
 static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
 {
-    printf("IO_URING ENABLED\n");
+    // printf("IO_URING ENABLED\n");
     /*
      * Since we didn't enable the FUSE_MAX_PAGES feature, the value of
      * fc->max_pages should be FUSE_DEFAULT_MAX_PAGES_PER_REQ, which is set by
@@ -385,7 +385,7 @@ static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
     }
 
     for (int i = 0; i < exp->num_queues; i++) {
-        printf("QUEUE INTI\n");
+        // printf("QUEUE INTI\n");
         FuseQueue *q = &exp->queues[i];
 
         q->ent.q = q;
@@ -403,7 +403,7 @@ static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
         };
 
         exp->queues[i].ent.fuse_cqe_handler.cb = fuse_uring_cqe_handler;
-        fprintf(stderr, "\n===== io_uring fd: %d ==========\n", q->ctx->fdmon_io_uring.ring_fd);
+        // fprintf(stderr, "\n===== io_uring fd: %d ==========\n", q->ctx->fdmon_io_uring.ring_fd);
 
         aio_add_sqe(fuse_uring_prep_sqe_register, &(exp->queues[i]),
             &(exp->queues[i].ent.fuse_cqe_handler));
@@ -1590,8 +1590,7 @@ static void coroutine_fn fuse_co_process_request_common(
     switch (opcode) {
     case FUSE_INIT: {
         const struct fuse_init_in *in = is_uring ?
-            (const struct fuse_init_in *)
-                &((FuseRingEnt *)opaque)->req_header.op_in :
+            (const struct fuse_init_in *)in_buf:
             (const struct fuse_init_in *)
                 (((struct fuse_in_header *)in_buf) + 1);
 
@@ -1637,8 +1636,7 @@ static void coroutine_fn fuse_co_process_request_common(
 
     case FUSE_SETATTR: {
         const struct fuse_setattr_in *in = is_uring ?
-            (const struct fuse_setattr_in *)
-                &((FuseRingEnt *)opaque)->req_header.op_in :
+            (const struct fuse_setattr_in *)in_buf:
             (const struct fuse_setattr_in *)
                 (((struct fuse_in_header *)in_buf) + 1);
 
@@ -1653,8 +1651,7 @@ static void coroutine_fn fuse_co_process_request_common(
 
     case FUSE_READ: {
         const struct fuse_read_in *in = is_uring ?
-            (const struct fuse_read_in *)
-                &((FuseRingEnt *)opaque)->req_header.op_in :
+            (const struct fuse_read_in *)in_buf :
             (const struct fuse_read_in *)
                 (((struct fuse_in_header *)in_buf) + 1);
 
@@ -1663,16 +1660,17 @@ static void coroutine_fn fuse_co_process_request_common(
     }
 
     case FUSE_WRITE: {
-        const struct fuse_write_in *in =
+        const struct fuse_write_in *in = is_uring ?
+            (const struct fuse_write_in *)in_buf :
             (const struct fuse_write_in *)((struct fuse_in_header *)in_buf + 1);
 
         struct fuse_write_out *out = is_uring ?
             (struct fuse_write_out *)out_buf :
             (struct fuse_write_out *)((struct fuse_out_header *)out_buf + 1);
 
-        uint32_t req_len = ((const struct fuse_in_header *)in_buf)->len;
-
         if (!is_uring) {
+            uint32_t req_len = ((const struct fuse_in_header *)in_buf)->len;
+
             if (unlikely(req_len < sizeof(struct fuse_in_header) + sizeof(*in) +
                         in->size)) {
                 warn_report("FUSE WRITE truncated; received %zu bytes of %" PRIu32,
@@ -1697,8 +1695,7 @@ static void coroutine_fn fuse_co_process_request_common(
 
     case FUSE_FALLOCATE: {
         const struct fuse_fallocate_in *in = is_uring ?
-            (const struct fuse_fallocate_in *)
-                &((FuseRingEnt *)opaque)->req_header.op_in :
+            (const struct fuse_fallocate_in *)in_buf:
             (const struct fuse_fallocate_in *)
                 (((struct fuse_in_header *)in_buf) + 1);
 
@@ -1717,8 +1714,7 @@ static void coroutine_fn fuse_co_process_request_common(
 #ifdef CONFIG_FUSE_LSEEK
     case FUSE_LSEEK: {
         const struct fuse_lseek_in *in = is_uring ?
-            (const struct fuse_lseek_in *)
-                &((FuseRingEnt *)opaque)->req_header.op_in :
+            (const struct fuse_lseek_in *)in_buf :
             (const struct fuse_lseek_in *)
                 (((struct fuse_in_header *)in_buf) + 1);
 
