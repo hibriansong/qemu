@@ -366,6 +366,7 @@ static void fuse_uring_prep_sqe_register(struct io_uring_sqe *sqe, void *opaque)
 
 static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
 {
+    printf("IO_URING ENABLED\n");
     /*
      * Since we didn't enable the FUSE_MAX_PAGES feature, the value of
      * fc->max_pages should be FUSE_DEFAULT_MAX_PAGES_PER_REQ, which is set by
@@ -384,6 +385,7 @@ static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
     }
 
     for (int i = 0; i < exp->num_queues; i++) {
+        printf("QUEUE INTI\n");
         FuseQueue *q = &exp->queues[i];
 
         q->ent.q = q;
@@ -401,6 +403,7 @@ static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
         };
 
         exp->queues[i].ent.fuse_cqe_handler.cb = fuse_uring_cqe_handler;
+        fprintf(stderr, "\n===== io_uring fd: %d ==========\n", q->ctx->fdmon_io_uring.ring_fd);
 
         aio_add_sqe(fuse_uring_prep_sqe_register, &(exp->queues[i]),
             &(exp->queues[i].ent.fuse_cqe_handler));
@@ -1804,7 +1807,7 @@ static void fuse_uring_prep_sqe_commit(struct io_uring_sqe *sqe, void *opaque)
 
 static void
 fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
-                         const void *buf)
+                         const void *out_data_buffer)
 {
     struct fuse_uring_req_header *rrh = &ent->req_header;
     struct fuse_out_header *out_header = (struct fuse_out_header *)&rrh->in_out;
@@ -1812,8 +1815,8 @@ fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
         (struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
 
     /* FUSE_READ */
-    if (buf && ret > 0) {
-        memcpy(ent->op_payload, buf, ret);
+    if (out_data_buffer && ret > 0) {
+        memcpy(ent->op_payload, out_data_buffer, ret);
     }
 
     out_header->error  = ret < 0 ? ret : 0;
@@ -1827,10 +1830,10 @@ fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
 
 /* Helper to send response for uring */
 static void send_response_uring(void *opaque, uint32_t req_id, ssize_t ret,
-                        const void *buf, void *out_buf)
+                        const void *out_data_buffer, void *payload)
 {
     FuseRingEnt *ent = (FuseRingEnt *)opaque;
-    fuse_uring_send_response(ent, req_id, ret, buf);
+    fuse_uring_send_response(ent, req_id, ret, out_data_buffer);
 }
 
 static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
