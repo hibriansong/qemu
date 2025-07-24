@@ -1579,7 +1579,7 @@ static void coroutine_fn fuse_co_process_request_common(
     int fd, /* -1 for uring */
     void (*send_response)(void *opaque, uint32_t req_id, ssize_t ret,
                          const void *buf, void *out_buf),
-    void *opaque, /* FuseQueue* or FuseRingEnt* */)
+    void *opaque /* FuseQueue* or FuseRingEnt* */)
 {
     void *out_data_buffer = NULL;
     ssize_t ret = 0;
