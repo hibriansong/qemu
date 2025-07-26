@@ -470,7 +470,7 @@ static int fuse_export_create(BlockExport *blk_exp,
     }
 
     // exp->is_uring = args->io_uring ? true : false;
-    exp->is_uring = true;
+    exp->is_uring = false;
 
     blk_set_dev_ops(exp->common.blk, &fuse_export_blk_dev_ops, exp);
 
@@ -1513,6 +1513,7 @@ static int fuse_write_buf_response(int fd, uint32_t req_id,
     }
 }
 
+
 /*
  * For use in fuse_co_process_request():
  * Returns a pointer to the parameter object for the given operation (inside of
@@ -1523,6 +1524,7 @@ static int fuse_write_buf_response(int fd, uint32_t req_id,
  * Note that queue->request_buf may be overwritten after yielding, so the
  * returned pointer must not be used across a function that may yield!
  */
+/*
 #define FUSE_IN_OP_STRUCT(op_name, queue) \
     ({ \
         const struct fuse_in_header *__in_hdr = \
@@ -1543,6 +1545,7 @@ static int fuse_write_buf_response(int fd, uint32_t req_id,
         } \
         __in; \
     })
+*/
 
 /*
  * For use in fuse_co_process_request():
@@ -1552,6 +1555,7 @@ static int fuse_write_buf_response(int fd, uint32_t req_id,
  *
  * (out_buf should be a char[] array.)
  */
+/*
 #define FUSE_OUT_OP_STRUCT(op_name, out_buf) \
     ({ \
         struct fuse_out_header *__out_hdr = \
@@ -1564,9 +1568,21 @@ static int fuse_write_buf_response(int fd, uint32_t req_id,
         \
         __out; \
     })
+*/
+
+#define FUSE_IN_OP_STRUCT_LEGACY(in_buf) \
+    ({ \
+        (void *)(((struct fuse_in_header *)in_buf) + 1); \
+    })
+
+#define FUSE_OUT_OP_STRUCT_LEGACY(out_buf) \
+    ({ \
+        (void *)(((struct fuse_out_header *)out_buf) + 1); \
+    })
+
 
 /*
- * Shared helper for FUfSE request processing. Handles both legacy and io_uring
+ * Shared helper for FUSE request processing. Handles both legacy and io_uring
  * paths.
  */
 static void coroutine_fn fuse_co_process_request_common(
@@ -1586,19 +1602,24 @@ static void coroutine_fn fuse_co_process_request_common(
 
     bool is_uring = exp->is_uring;
 
+    void *op_in_buf = (is_uring && opcode != FUSE_INIT) ?
+                (void *)in_buf : (void *)FUSE_IN_OP_STRUCT_LEGACY(in_buf);
+
+    void *op_out_buf = (is_uring && opcode != FUSE_INIT) ?
+                (void *)out_buf : (void *)FUSE_OUT_OP_STRUCT_LEGACY(out_buf);
+
     switch (opcode) {
     case FUSE_INIT: {
         const struct fuse_init_in *in =
-            (const struct fuse_init_in *)
-                (((struct fuse_in_header *)in_buf) + 1);
+            (const struct fuse_init_in *)FUSE_IN_OP_STRUCT_LEGACY(in_buf);
 
         struct fuse_init_out *out =
-            (struct fuse_init_out *)((struct fuse_out_header *)out_buf + 1);
+            (struct fuse_init_out *)FUSE_OUT_OP_STRUCT_LEGACY(out_buf);
 
         ret = fuse_co_init(exp, out, in->max_readahead, in->flags);
 #ifdef CONFIG_LINUX_IO_URING
         /* FUSE-over-io_uring enabled && start from the tradition path */
-        if (exp->is_uring && fd != -1) {
+        if (is_uring && fd != -1) {
             fuse_uring_start(exp, out);
         }
 #endif
@@ -1606,9 +1627,8 @@ static void coroutine_fn fuse_co_process_request_common(
     }
 
     case FUSE_OPEN: {
-        struct fuse_open_out *out = is_uring ?
-            (struct fuse_open_out *)out_buf :
-            (struct fuse_open_out *)((struct fuse_out_header *)out_buf + 1);
+        struct fuse_open_out *out =
+            (struct fuse_open_out *)op_out_buf;
 
         ret = fuse_co_open(exp, out);
         break;
@@ -1623,23 +1643,19 @@ static void coroutine_fn fuse_co_process_request_common(
         break;
 
     case FUSE_GETATTR: {
-        struct fuse_attr_out *out = is_uring ?
-            (struct fuse_attr_out *)out_buf :
-            (struct fuse_attr_out *)((struct fuse_out_header *)out_buf + 1);
+        struct fuse_attr_out *out =
+            (struct fuse_attr_out *)op_out_buf;
 
         ret = fuse_co_getattr(exp, out);
         break;
     }
 
     case FUSE_SETATTR: {
-        const struct fuse_setattr_in *in = is_uring ?
-            (const struct fuse_setattr_in *)in_buf:
-            (const struct fuse_setattr_in *)
-                (((struct fuse_in_header *)in_buf) + 1);
+        const struct fuse_setattr_in *in =
+            (const struct fuse_setattr_in *)op_in_buf;
 
-        struct fuse_attr_out *out = is_uring ?
-            (struct fuse_attr_out *)out_buf :
-            (struct fuse_attr_out *)((struct fuse_out_header *)out_buf + 1);
+        struct fuse_attr_out *out =
+            (struct fuse_attr_out *)op_out_buf;
 
         ret = fuse_co_setattr(exp, out, in->valid, in->size, in->mode,
                               in->uid, in->gid);
@@ -1647,37 +1663,35 @@ static void coroutine_fn fuse_co_process_request_common(
     }
 
     case FUSE_READ: {
-        const struct fuse_read_in *in = is_uring ?
-            (const struct fuse_read_in *)in_buf :
-            (const struct fuse_read_in *)
-                (((struct fuse_in_header *)in_buf) + 1);
+        const struct fuse_read_in *in =
+            (const struct fuse_read_in *)op_in_buf;
 
         ret = fuse_co_read(exp, &out_data_buffer, in->offset, in->size);
         break;
     }
 
     case FUSE_WRITE: {
-        const struct fuse_write_in *in = is_uring ?
-            (const struct fuse_write_in *)in_buf :
-            (const struct fuse_write_in *)((struct fuse_in_header *)in_buf + 1);
+        const struct fuse_write_in *in =
+            (const struct fuse_write_in *)op_in_buf;
 
-        struct fuse_write_out *out = is_uring ?
-            (struct fuse_write_out *)out_buf :
-            (struct fuse_write_out *)((struct fuse_out_header *)out_buf + 1);
+        struct fuse_write_out *out =
+            (struct fuse_write_out *)op_out_buf;
 
         if (!is_uring) {
             uint32_t req_len = ((const struct fuse_in_header *)in_buf)->len;
 
             if (unlikely(req_len < sizeof(struct fuse_in_header) + sizeof(*in) +
                         in->size)) {
-                warn_report("FUSE WRITE truncated; received %zu bytes of %" PRIu32,
+                warn_report("FUSE WRITE truncated; received %zu bytes of %"
+                    PRIu32,
                     req_len - sizeof(struct fuse_in_header) - sizeof(*in),
                     in->size);
                 ret = -EINVAL;
                 break;
             }
         } else {
-            assert(in->size <= ((FuseRingEnt *)opaque)->req_header.ring_ent_in_out.payload_sz);
+            assert(in->size <=
+                ((FuseRingEnt *)opaque)->req_header.ring_ent_in_out.payload_sz);
         }
 
         assert(in->size <= FUSE_MAX_WRITE_BYTES);
@@ -1691,10 +1705,8 @@ static void coroutine_fn fuse_co_process_request_common(
     }
 
     case FUSE_FALLOCATE: {
-        const struct fuse_fallocate_in *in = is_uring ?
-            (const struct fuse_fallocate_in *)in_buf:
-            (const struct fuse_fallocate_in *)
-                (((struct fuse_in_header *)in_buf) + 1);
+        const struct fuse_fallocate_in *in =
+            (const struct fuse_fallocate_in *)op_in_buf;
 
         ret = fuse_co_fallocate(exp, in->offset, in->length, in->mode);
         break;
@@ -1710,14 +1722,11 @@ static void coroutine_fn fuse_co_process_request_common(
 
 #ifdef CONFIG_FUSE_LSEEK
     case FUSE_LSEEK: {
-        const struct fuse_lseek_in *in = is_uring ?
-            (const struct fuse_lseek_in *)in_buf :
-            (const struct fuse_lseek_in *)
-                (((struct fuse_in_header *)in_buf) + 1);
+        const struct fuse_lseek_in *in =
+            (const struct fuse_lseek_in *)op_in_buf;
 
-        struct fuse_lseek_out *out = is_uring ?
-            (struct fuse_lseek_out *)out_buf :
-            (struct fuse_lseek_out *)((struct fuse_out_header *)out_buf + 1);
+        struct fuse_lseek_out *out =
+            (struct fuse_lseek_out *)op_out_buf;
 
         ret = fuse_co_lseek(exp, out, in->offset, in->whence);
         break;
@@ -1765,8 +1774,6 @@ fuse_co_process_request(FuseQueue *q, void *spillover_buf)
     /*
      * Return buffer.  Must be large enough to hold all return headers, but does
      * not include space for data returned by read requests.
-     * (FUSE_IN_OP_STRUCT() verifies at compile time that out_buf is indeed
-     * large enough.)
      */
     char out_buf[sizeof(struct fuse_out_header) +
         MAX_CONST(sizeof(struct fuse_init_out),
