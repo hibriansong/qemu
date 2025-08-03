@@ -16,6 +16,7 @@
  * along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/compiler.h"
 #define FUSE_USE_VERSION 31
 
 #include "qemu/osdep.h"
@@ -312,6 +313,10 @@ static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
     FuseRingEnt *ent = container_of(cqe_handler, FuseRingEnt, fuse_cqe_handler);
     Coroutine *co;
     FuseExport *exp = ent->q->exp;
+
+    if (unlikely(exp->halted)) {
+        return;
+    }
 
     int err = cqe_handler->cqe.res;
     if (err != 0) {
@@ -1827,6 +1832,8 @@ fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
 
     aio_add_sqe(fuse_uring_prep_sqe_commit, ent,
                     &ent->fuse_cqe_handler);
+
+    // TODO increase the in-fligth counter
 }
 
 /* Helper to send response for uring */
