@@ -320,11 +320,9 @@ static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
 
     int err = cqe_handler->cqe.res;
     if (err != 0) {
-        /* TODO end_conn support */
-
         /* -ENOTCONN is ok on umount  */
-        if (err != -EINTR && err != -EOPNOTSUPP &&
-            err != -EAGAIN && err != -ENOTCONN) {
+        if (err != -EINTR && err != -EAGAIN &&
+            err != -ENOTCONN) {
             fuse_export_halt(exp);
         }
     } else {
@@ -767,10 +765,6 @@ static void fuse_export_delete_uring(FuseExport *exp)
 {
     exp->is_uring = false;
 
-    /*
-     * TODO
-     * end_conn handling
-     */
     for (size_t qid = 0; qid < exp->num_queues; qid++) {
         g_free(exp->queues[qid].ent.op_payload);
     }
@@ -798,11 +792,6 @@ static void fuse_export_delete(BlockExport *blk_exp)
 {
     FuseExport *exp = container_of(blk_exp, FuseExport, common);
 
-#ifdef CONFIG_LINUX_IO_URING
-    if (exp->is_uring)
-        fuse_export_delete_uring(exp);
-#endif
-
     for (int i = 0; i < exp->num_queues; i++) {
         FuseQueue *q = &exp->queues[i];
 
@@ -814,7 +803,6 @@ static void fuse_export_delete(BlockExport *blk_exp)
             qemu_vfree(q->spillover_buf);
         }
     }
-    g_free(exp->queues);
 
     if (exp->fuse_session) {
         if (exp->mounted) {
@@ -825,6 +813,13 @@ static void fuse_export_delete(BlockExport *blk_exp)
     }
 
     g_free(exp->mountpoint);
+
+#ifdef CONFIG_LINUX_IO_URING
+    if (exp->is_uring)
+        fuse_export_delete_uring(exp);
+#endif
+
+    g_free(exp->queues);
 }
 
 /**
@@ -1832,8 +1827,6 @@ fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
 
     aio_add_sqe(fuse_uring_prep_sqe_commit, ent,
                     &ent->fuse_cqe_handler);
-
-    // TODO increase the in-fligth counter
 }
 
 /* Helper to send response for uring */
