@@ -298,6 +298,8 @@ static void coroutine_fn co_fuse_uring_queue_handle_cqes(void *opaque)
     /* Going to process requests */
     fuse_inc_in_flight(exp);
 
+    /* A ring entry returned */
+    blk_exp_unref(&exp->common);
 
     fuse_uring_co_process_request(ent);
 
@@ -323,6 +325,9 @@ static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
             err != -ENOTCONN) {
             fuse_export_halt(exp);
         }
+
+        /* A ring entry returned */
+        blk_exp_unref(&exp->common);
     } else {
         co = qemu_coroutine_create(co_fuse_uring_queue_handle_cqes, ent);
         qemu_coroutine_enter(co);
@@ -370,6 +375,8 @@ static void fuse_uring_submit_register(void *opaque)
     FuseQueue *q = opaque;
     FuseExport *exp = q->exp;
 
+    /* Commit and fetch a ring entry */
+    blk_exp_ref(&exp->common);
 
     aio_add_sqe(fuse_uring_prep_sqe_register, q, &(q->ent.fuse_cqe_handler));
 }
@@ -762,6 +769,17 @@ static void read_from_fuse_fd(void *opaque)
     qemu_coroutine_enter(co);
 }
 
+#ifdef CONFIG_LINUX_IO_URING
+static void fuse_export_delete_uring(FuseExport *exp)
+{
+    exp->is_uring = false;
+
+    for (size_t qid = 0; qid < exp->num_queues; qid++) {
+        g_free(exp->queues[qid].ent.op_payload);
+    }
+}
+#endif
+
 static void fuse_export_shutdown(BlockExport *blk_exp)
 {
     FuseExport *exp = container_of(blk_exp, FuseExport, common);
@@ -777,6 +795,23 @@ static void fuse_export_shutdown(BlockExport *blk_exp)
          */
         g_hash_table_remove(exports, exp->mountpoint);
     }
+
+    for (int i = 0; i < exp->num_queues; i++) {
+        FuseQueue *q = &exp->queues[i];
+
+        /* Queue 0's FD belongs to the FUSE session */
+        if (i > 0 && q->fuse_fd >= 0) {
+            close(q->fuse_fd);
+        }
+    }
+
+    if (exp->fuse_session) {
+        if (exp->mounted) {
+            fuse_session_unmount(exp->fuse_session);
+        }
+
+        fuse_session_destroy(exp->fuse_session);
+    }
 }
 
 static void fuse_export_delete(BlockExport *blk_exp)
@@ -786,25 +821,20 @@ static void fuse_export_delete(BlockExport *blk_exp)
     for (int i = 0; i < exp->num_queues; i++) {
         FuseQueue *q = &exp->queues[i];
 
-        /* Queue 0's FD belongs to the FUSE session */
-        if (i > 0 && q->fuse_fd >= 0) {
-            close(q->fuse_fd);
-        }
         if (q->spillover_buf) {
             qemu_vfree(q->spillover_buf);
         }
     }
-    g_free(exp->queues);
-
-    if (exp->fuse_session) {
-        if (exp->mounted) {
-            fuse_session_unmount(exp->fuse_session);
-        }
-
-        fuse_session_destroy(exp->fuse_session);
-    }
 
     g_free(exp->mountpoint);
+
+#ifdef CONFIG_LINUX_IO_URING
+    if (exp->is_uring) {
+        fuse_export_delete_uring(exp);
+    }
+#endif
+
+    g_free(exp->queues);
 }
 
 /**
@@ -1755,8 +1785,8 @@ fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
     /* out_header->len = ret > 0 ? ret : 0; */
     ent_in_out->payload_sz = ret > 0 ? ret : 0;
 
-
-    qemu_vfree(spillover_buf);
+    /* Commit and fetch a ring entry */
+    blk_exp_ref(&exp->common);
     aio_add_sqe(fuse_uring_prep_sqe_commit, ent,
                     &ent->fuse_cqe_handler);
 }
