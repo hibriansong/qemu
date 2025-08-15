@@ -48,6 +48,11 @@
 #include <linux/fs.h>
 #endif
 
+#define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
+
+/* room needed in buffer to accommodate header */
+#define FUSE_BUFFER_HEADER_SIZE 0x1000
+
 /* Prevent overly long bounce buffer allocations */
 #define FUSE_MAX_READ_BYTES (MIN(BDRV_REQUEST_MAX_BYTES, 1 * 1024 * 1024))
 /*
@@ -63,12 +68,31 @@
     (FUSE_MAX_WRITE_BYTES - FUSE_IN_PLACE_WRITE_BYTES)
 
 typedef struct FuseExport FuseExport;
+typedef struct FuseQueue FuseQueue;
+
+typedef struct FuseRingEnt {
+    /* back pointer */
+    FuseQueue *q;
+
+    /* commit id of a fuse request */
+    uint64_t req_commit_id;
+
+    /* fuse request header and payload */
+    struct fuse_uring_req_header req_header;
+    void *op_payload;
+    size_t req_payload_sz;
+
+    /* The vector passed to the kernel */
+    struct iovec iov[2];
+
+    CqeHandler fuse_cqe_handler;
+} FuseRingEnt;
 
 /*
  * One FUSE "queue", representing one FUSE FD from which requests are fetched
  * and processed.  Each queue is tied to an AioContext.
  */
-typedef struct FuseQueue {
+struct FuseQueue {
     FuseExport *exp;
 
     AioContext *ctx;
@@ -109,7 +133,12 @@ typedef struct FuseQueue {
      * Free this buffer with qemu_vfree().
      */
     void *spillover_buf;
-} FuseQueue;
+
+#ifdef CONFIG_LINUX_IO_URING
+    int qid;
+    FuseRingEnt ent;
+#endif
+};
 
 /*
  * Verify that FuseQueue.request_buf plus the spill-over buffer together
@@ -148,6 +177,7 @@ struct FuseExport {
     bool growable;
     /* Whether allow_other was used as a mount option or not */
     bool allow_other;
+    bool is_uring;
 
     mode_t st_mode;
     uid_t st_uid;
@@ -257,6 +287,93 @@ static const BlockDevOps fuse_export_blk_dev_ops = {
     .drained_poll  = fuse_export_drained_poll,
 };
 
+#ifdef CONFIG_LINUX_IO_URING
+
+static void fuse_uring_sqe_set_req_data(struct fuse_uring_cmd_req *req,
+                    const unsigned int qid,
+                    const unsigned int commit_id)
+{
+    req->qid = qid;
+    req->commit_id = commit_id;
+    req->flags = 0;
+}
+
+static void fuse_uring_sqe_prepare(struct io_uring_sqe *sqe, FuseQueue *q,
+               __u32 cmd_op)
+{
+    sqe->opcode = IORING_OP_URING_CMD;
+
+    sqe->fd = q->fuse_fd;
+    sqe->rw_flags = 0;
+    sqe->ioprio = 0;
+    sqe->off = 0;
+
+    sqe->cmd_op = cmd_op;
+    sqe->__pad1 = 0;
+}
+
+static void fuse_uring_prep_sqe_register(struct io_uring_sqe *sqe, void *opaque)
+{
+    FuseQueue *q = opaque;
+    struct fuse_uring_cmd_req *req = (void *)&sqe->cmd[0];
+
+    fuse_uring_sqe_prepare(sqe, q, FUSE_IO_URING_CMD_REGISTER);
+
+    sqe->addr = (uint64_t)(q->ent.iov);
+    sqe->len = 2;
+
+    fuse_uring_sqe_set_req_data(req, q->qid, 0);
+}
+
+static void fuse_uring_submit_register(void *opaque)
+{
+    FuseQueue *q = opaque;
+    FuseExport *exp = q->exp;
+
+
+    aio_add_sqe(fuse_uring_prep_sqe_register, q, &(q->ent.fuse_cqe_handler));
+}
+
+static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
+{
+    /*
+     * Since we didn't enable the FUSE_MAX_PAGES feature, the value of
+     * fc->max_pages should be FUSE_DEFAULT_MAX_PAGES_PER_REQ, which is set by
+     * the kernel by default. Also, max_write should not exceed
+     * FUSE_DEFAULT_MAX_PAGES_PER_REQ * PAGE_SIZE.
+     */
+    size_t bufsize = out->max_write + FUSE_BUFFER_HEADER_SIZE;
+
+    if (!(out->flags & FUSE_MAX_PAGES)) {
+        bufsize = FUSE_DEFAULT_MAX_PAGES_PER_REQ * qemu_real_host_page_size()
+                         + FUSE_BUFFER_HEADER_SIZE;
+    }
+
+    for (int i = 0; i < exp->num_queues; i++) {
+        FuseQueue *q = &exp->queues[i];
+        FuseRingEnt *ent = &q->ent;
+
+        ent->q = q;
+
+        ent->req_payload_sz = bufsize - FUSE_BUFFER_HEADER_SIZE;
+        ent->op_payload = g_malloc0(ent->req_payload_sz);
+
+        ent->iov[0] = (struct iovec) {
+            &(ent->req_header),
+            sizeof(struct fuse_uring_req_header)
+        };
+        ent->iov[1] = (struct iovec) {
+            ent->op_payload,
+            ent->req_payload_sz
+        };
+
+        ent->fuse_cqe_handler.cb = fuse_uring_cqe_handler;
+
+        aio_bh_schedule_oneshot(q->ctx, fuse_uring_submit_register, q);
+    }
+}
+#endif
+
 static int fuse_export_create(BlockExport *blk_exp,
                               BlockExportOptions *blk_exp_args,
                               AioContext *const *multithread,
@@ -280,6 +397,9 @@ static int fuse_export_create(BlockExport *blk_exp,
 
         for (size_t i = 0; i < mt_count; i++) {
             exp->queues[i] = (FuseQueue) {
+#ifdef CONFIG_LINUX_IO_URING
+                .qid = i,
+#endif
                 .exp = exp,
                 .ctx = multithread[i],
                 .fuse_fd = -1,
@@ -293,6 +413,9 @@ static int fuse_export_create(BlockExport *blk_exp,
         exp->num_queues = 1;
         exp->queues = g_new(FuseQueue, 1);
         exp->queues[0] = (FuseQueue) {
+#ifdef CONFIG_LINUX_IO_URING
+            .qid = 0,
+#endif
             .exp = exp,
             .ctx = exp->common.ctx,
             .fuse_fd = -1,
@@ -311,6 +434,8 @@ static int fuse_export_create(BlockExport *blk_exp,
             return ret;
         }
     }
+
+    exp->is_uring = args->io_uring ? true : false;
 
     blk_set_dev_ops(exp->common.blk, &fuse_export_blk_dev_ops, exp);
 
@@ -687,15 +812,22 @@ static ssize_t coroutine_fn
 fuse_co_init(FuseExport *exp, struct fuse_init_out *out,
              uint32_t max_readahead, uint32_t flags)
 {
-    const uint32_t supported_flags = FUSE_ASYNC_READ | FUSE_ASYNC_DIO;
+    const uint32_t supported_flags = FUSE_ASYNC_READ | FUSE_ASYNC_DIO
+                                     | FUSE_INIT_EXT;
+    uint64_t outargflags = flags;
+
+#ifdef CONFIG_LINUX_IO_URING
+    if (exp->is_uring)
+        outargflags |= FUSE_OVER_IO_URING;
+#endif
 
     *out = (struct fuse_init_out) {
         .major = FUSE_KERNEL_VERSION,
         .minor = FUSE_KERNEL_MINOR_VERSION,
         .max_readahead = max_readahead,
         .max_write = FUSE_MAX_WRITE_BYTES,
-        .flags = flags & supported_flags,
-        .flags2 = 0,
+        .flags = outargflags & supported_flags,
+        .flags2 = outargflags >> 32,
 
         /* libfuse maximum: 2^16 - 1 */
         .max_background = UINT16_MAX,
@@ -1393,22 +1525,17 @@ fuse_co_process_request(FuseQueue *q, void *spillover_buf)
     struct fuse_out_header *out_hdr = (struct fuse_out_header *)out_buf;
     /* For read requests: Data to be returned */
     void *out_data_buffer = NULL;
-    ssize_t ret;
 
-    /* Limit scope to ensure pointer is no longer used after yielding */
-    {
-        const struct fuse_in_header *in_hdr =
-            (const struct fuse_in_header *)q->request_buf;
-
-        opcode = in_hdr->opcode;
-        req_id = in_hdr->unique;
-    }
+    bool is_uring = exp->is_uring;
 
     switch (opcode) {
     case FUSE_INIT: {
-        const struct fuse_init_in *in = FUSE_IN_OP_STRUCT(init, q);
-        ret = fuse_co_init(exp, FUSE_OUT_OP_STRUCT(init, out_buf),
-                           in->max_readahead, in->flags);
+#ifdef CONFIG_LINUX_IO_URING
+        /* FUSE-over-io_uring enabled && start from the tradition path */
+        if (is_uring) {
+            fuse_uring_start(exp, out);
+        }
+#endif
         break;
     }
 
