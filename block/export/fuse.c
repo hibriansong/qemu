@@ -39,6 +39,7 @@
 
 #include "standard-headers/linux/fuse.h"
 #include <sys/ioctl.h>
+#include <sys/sysinfo.h>
 
 #if defined(CONFIG_FALLOCATE_ZERO_RANGE)
 #include <linux/falloc.h>
@@ -321,6 +322,8 @@ static void coroutine_fn co_fuse_uring_queue_handle_cqes(void *opaque)
     fuse_inc_in_flight(exp);
 
     /* A ring entry returned */
+    blk_exp_unref(&exp->common);
+
     fuse_uring_co_process_request(ent);
 
     /* Finished processing requests */
@@ -345,6 +348,9 @@ static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
             err != -ENOTCONN) {
             fuse_export_halt(exp);
         }
+
+        /* A ring entry returned */
+        blk_exp_unref(&exp->common);
     } else {
         co = qemu_coroutine_create(co_fuse_uring_queue_handle_cqes, ent);
         qemu_coroutine_enter(co);
@@ -392,6 +398,8 @@ static void fuse_uring_submit_register(void *opaque)
     FuseRingEnt *ent = opaque;
     FuseExport *exp = ent->rq->q->exp;
 
+    /* Commit and fetch a ring entry */
+    blk_exp_ref(&exp->common);
 
     aio_add_sqe(fuse_uring_prep_sqe_register, ent, &(ent->fuse_cqe_handler));
 }
@@ -886,6 +894,38 @@ static void read_from_fuse_fd(void *opaque)
     qemu_coroutine_enter(co);
 }
 
+#ifdef CONFIG_LINUX_IO_URING
+static void fuse_ring_queue_manager_destroy(FuseRingQueueManager *manager)
+{
+    if (!manager) {
+        return;
+    }
+
+    for (int i = 0; i < manager->num_ring_queues; i++) {
+        FuseRingQueue *rq = &manager->ring_queues[i];
+
+        for (int j = 0; j < FUSE_DEFAULT_RING_QUEUE_DEPTH; j++) {
+            g_free(rq->ent[j].op_payload);
+        }
+        g_free(rq->ent);
+    }
+
+    g_free(manager->ring_queues);
+    g_free(manager);
+}
+
+static void fuse_export_delete_uring(FuseExport *exp)
+{
+    exp->is_uring = false;
+
+    /* Clean up ring queue manager */
+    if (exp->ring_queue_manager) {
+        fuse_ring_queue_manager_destroy(exp->ring_queue_manager);
+        exp->ring_queue_manager = NULL;
+    }
+}
+#endif
+
 static void fuse_export_shutdown(BlockExport *blk_exp)
 {
     FuseExport *exp = container_of(blk_exp, FuseExport, common);
@@ -901,24 +941,15 @@ static void fuse_export_shutdown(BlockExport *blk_exp)
          */
         g_hash_table_remove(exports, exp->mountpoint);
     }
-}
 
-static void fuse_export_delete(BlockExport *blk_exp)
-{
-    FuseExport *exp = container_of(blk_exp, FuseExport, common);
-
-    for (int i = 0; i < exp->num_queues; i++) {
+    for (size_t i = 0; i < exp->num_queues; i++) {
         FuseQueue *q = &exp->queues[i];
 
         /* Queue 0's FD belongs to the FUSE session */
         if (i > 0 && q->fuse_fd >= 0) {
             close(q->fuse_fd);
         }
-        if (q->spillover_buf) {
-            qemu_vfree(q->spillover_buf);
-        }
     }
-    g_free(exp->queues);
 
     if (exp->fuse_session) {
         if (exp->mounted) {
@@ -927,8 +958,29 @@ static void fuse_export_delete(BlockExport *blk_exp)
 
         fuse_session_destroy(exp->fuse_session);
     }
+}
+
+static void fuse_export_delete(BlockExport *blk_exp)
+{
+    FuseExport *exp = container_of(blk_exp, FuseExport, common);
+
+    for (size_t i = 0; i < exp->num_queues; i++) {
+        FuseQueue *q = &exp->queues[i];
+
+        if (q->spillover_buf) {
+            qemu_vfree(q->spillover_buf);
+        }
+    }
 
     g_free(exp->mountpoint);
+
+#ifdef CONFIG_LINUX_IO_URING
+    if (exp->is_uring) {
+        fuse_export_delete_uring(exp);
+    }
+#endif
+
+    g_free(exp->queues);
 }
 
 /**
@@ -1917,6 +1969,9 @@ fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, ssize_t ret,
     out_header->unique = req_id;
     /* out_header->len = ret > 0 ? ret : 0; */
     ent_in_out->payload_sz = ret > 0 ? ret : 0;
+
+    /* Commit and fetch a ring entry */
+    blk_exp_ref(&exp->common);
     aio_add_sqe(fuse_uring_prep_sqe_commit, ent,
                     &ent->fuse_cqe_handler);
 }
