@@ -94,6 +94,8 @@ def make_argparser() -> argparse.ArgumentParser:
         mg.add_argument('-' + fmt, dest='imgfmt', action='store_const',
                         const=fmt, help=f'test {fmt}')
 
+    # To test FUSE-over-io_uring, set the environment variable
+    # FUSE_OVER_IO_URING=1. This applies only when using the 'fuse' protocol
     protocol_list = ['file', 'rbd', 'nbd', 'ssh', 'nfs', 'fuse']
     g_prt = p.add_argument_group(
         '  image protocol options',
