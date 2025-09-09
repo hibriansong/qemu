@@ -49,9 +49,6 @@
 #include <linux/fs.h>
 #endif
 
-/* room needed in buffer to accommodate header */
-#define FUSE_BUFFER_HEADER_SIZE 0x1000
-
 /* Prevent overly long bounce buffer allocations */
 #define FUSE_MAX_READ_BYTES (MIN(BDRV_REQUEST_MAX_BYTES, 1 * 1024 * 1024))
 /*
@@ -72,8 +69,19 @@ typedef struct FuseQueue FuseQueue;
 #ifdef CONFIG_LINUX_IO_URING
 #define FUSE_DEFAULT_RING_QUEUE_DEPTH 64
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
+/*
+ * Each FuseRingEnt represents a FUSE request. It exposes two iovec entries for
+ * communication between the kernel driver and the userspace server:
+ *
+ *  - The first iovec holds the request header (FUSE_BUFFER_HEADER_SIZE),
+ *    containing metadata about the request.
+ *
+ *  - The second iovec holds the payload, used for READ/WRITE operations.
+ */
+#define FUSE_BUFFER_HEADER_SIZE 0x1000
 
 typedef struct FuseRingQueue FuseRingQueue;
+
 typedef struct FuseRingEnt {
     /* back pointer */
     FuseRingQueue *rq;
@@ -167,6 +175,14 @@ struct FuseQueue {
 #endif
 };
 
+/*
+ * Verify that FuseQueue.request_buf plus the spill-over buffer together
+ * are big enough to be accepted by the FUSE kernel driver.
+ */
+QEMU_BUILD_BUG_ON(sizeof(((FuseQueue *)0)->request_buf) +
+                  FUSE_SPILLOVER_BUF_SIZE <
+                  FUSE_MIN_READ_BUFFER);
+
 struct FuseExport {
     BlockExport common;
 
@@ -199,7 +215,9 @@ struct FuseExport {
 
 #ifdef CONFIG_LINUX_IO_URING
     bool is_uring;
+    bool uring_started;
     size_t ring_queue_depth;
+
     FuseRingQueueManager *ring_queue_manager;
 #endif
 
@@ -315,13 +333,23 @@ static const BlockDevOps fuse_export_blk_dev_ops = {
 static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent);
 
 /*
- * Protect FuseExport from premature deletion while handling FUSE requests.
- * CQE handlers inc/dec the in_flight counter; when it reaches 0, the export
- * can be freed. This follows the same logic as traditional FUSE.
+ * fuse_inc_in_flight()/fuse_dec_in_flight() wrap the lifecycle of FUSE
+ * requests that the server is processing. This ensures that the block
+ * layer's drain operation waits for requests to complete and prevents
+ * the export from being deleted while requests are still in progress.
  *
- * Since FUSE SQEs cannot be canceled, a CQE may arrive after commit even if
- * the export is deleted. To prevent this, we ref/unref the export explicitly
- * at SQE submission and CQE completion.
+ * blk_exp_ref()/blk_exp_unref() prevent the export from being deleted
+ * while there are still outstanding dependencies on it.
+ *
+ * Mapping to FUSE-over-io_uring:
+ *
+ * - When an SQE is submitted, blk_exp_ref() must be called. After the
+ *   CQE has been processed, blk_exp_unref() must be called. This ensures
+ *   the export is not deleted before all CQEs have been handled.
+ *
+ * - The coroutine that processes a FUSE request must call
+ *   fuse_inc_in_flight() before processing begins and
+ *   fuse_dec_in_flight() after processing ends.
  */
 static void coroutine_fn co_fuse_uring_queue_handle_cqe(void *opaque)
 {
@@ -354,8 +382,7 @@ static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
 
     if (err != 0) {
         /* -ENOTCONN is ok on umount  */
-        if (err != -EINTR && err != -EAGAIN &&
-            err != -ENOTCONN) {
+        if (err != -ENOTCONN) {
             fuse_export_halt(exp);
         }
 
@@ -492,6 +519,10 @@ void fuse_schedule_ring_queue_registrations(FuseExport *exp,
 
 static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
 {
+    assert(!exp->uring_started);
+
+    exp->uring_started = true;
+
     /*
      * Since we didn't enable the FUSE_MAX_PAGES feature, the value of
      * fc->max_pages should be FUSE_DEFAULT_MAX_PAGES_PER_REQ, which is set by
