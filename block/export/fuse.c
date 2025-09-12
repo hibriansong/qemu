@@ -927,6 +927,7 @@ static void fuse_ring_queue_manager_destroy(FuseRingQueueManager *manager)
 static void fuse_export_delete_uring(FuseExport *exp)
 {
     exp->is_uring = false;
+    exp->uring_started = false;
 
     /* Clean up ring queue manager */
     if (exp->ring_queue_manager) {
@@ -952,22 +953,18 @@ static void fuse_export_shutdown(BlockExport *blk_exp)
         g_hash_table_remove(exports, exp->mountpoint);
     }
 
-    for (size_t i = 0; i < exp->num_queues; i++) {
-        FuseQueue *q = &exp->queues[i];
+#ifdef CONFIG_LINUX_IO_URING
+    if (exp->is_uring) {
+        if (exp->fuse_session) {
+            if (exp->mounted) {
+                fuse_session_unmount(exp->fuse_session);
+            }
 
-        /* Queue 0's FD belongs to the FUSE session */
-        if (i > 0 && q->fuse_fd >= 0) {
-            close(q->fuse_fd);
+            fuse_session_destroy(exp->fuse_session);
         }
+        g_free(exp->mountpoint);
     }
-
-    if (exp->fuse_session) {
-        if (exp->mounted) {
-            fuse_session_unmount(exp->fuse_session);
-        }
-
-        fuse_session_destroy(exp->fuse_session);
-    }
+#endif
 }
 
 static void fuse_export_delete(BlockExport *blk_exp)
@@ -977,20 +974,33 @@ static void fuse_export_delete(BlockExport *blk_exp)
     for (size_t i = 0; i < exp->num_queues; i++) {
         FuseQueue *q = &exp->queues[i];
 
+        /* Queue 0's FD belongs to the FUSE session */
+        if (i > 0 && q->fuse_fd >= 0) {
+            close(q->fuse_fd);
+        }
         if (q->spillover_buf) {
             qemu_vfree(q->spillover_buf);
         }
     }
-
-    g_free(exp->mountpoint);
+    g_free(exp->queues);
 
 #ifdef CONFIG_LINUX_IO_URING
     if (exp->is_uring) {
         fuse_export_delete_uring(exp);
+    } else {
+#endif
+        if (exp->fuse_session) {
+            if (exp->mounted) {
+                fuse_session_unmount(exp->fuse_session);
+            }
+
+            fuse_session_destroy(exp->fuse_session);
+        }
+
+        g_free(exp->mountpoint);
+#ifdef CONFIG_LINUX_IO_URING
     }
 #endif
-
-    g_free(exp->queues);
 }
 
 /**
