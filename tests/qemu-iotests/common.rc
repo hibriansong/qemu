@@ -619,21 +619,11 @@ _rm_test_img()
 
         kill "${FUSE_PIDS[index]}"
 
-        sleep 1
-
         # Wait until the mount is gone
         timeout=10 # *0.5 s
         while true; do
-            # Will show the mount point; if the mount is still there,
-            # it will be $img.
-            df_output=$(df "$img" 2>/dev/null)
-
-            # But df may also show an error ("Transpoint endpoint not
-            # connected"), so retry in such cases
-            if [ -n "$df_output" ]; then
-                if ! echo "$df_output" | grep -q "$img"; then
-                    break
-                fi
+            if ! mount | grep -q "$img"; then
+                break
             fi
 
             sleep 0.5
