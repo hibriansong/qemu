@@ -458,7 +458,7 @@ void fdmon_io_uring_setup(AioContext *ctx, Error **errp)
     flags = IORING_SETUP_SQE128;
 
     ret = io_uring_queue_init(FDMON_IO_URING_ENTRIES,
-                            &ctx->fdmon_io_uring, flags);
+                              &ctx->fdmon_io_uring, flags);
     if (ret != 0) {
         error_setg_errno(errp, -ret, "Failed to initialize io_uring");
         return;
