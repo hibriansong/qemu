@@ -67,7 +67,7 @@ typedef struct FuseExport FuseExport;
 typedef struct FuseQueue FuseQueue;
 
 #ifdef CONFIG_LINUX_IO_URING
-#define FUSE_DEFAULT_RING_QUEUE_DEPTH 64
+#define FUSE_DEFAULT_URING_QUEUE_DEPTH 64
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
 /*
  * Each FuseRingEnt represents a FUSE request. It exposes two iovec entries for
@@ -113,15 +113,9 @@ struct FuseRingQueue {
     FuseQueue *q;
     FuseRingEnt *ent;
 
-    /* List entry for ring_queues */
+    /* List entry for uring_queues */
     QLIST_ENTRY(FuseRingQueue) next;
 };
-
-typedef struct FuseRingQueueManager {
-    FuseRingQueue *ring_queues;
-    int num_ring_queues;
-    int num_fuse_queues;
-} FuseRingQueueManager;
 #endif /* CONFIG_LINUX_IO_URING */
 
 /*
@@ -197,7 +191,7 @@ struct FuseExport {
      */
     bool halted;
 
-    size_t num_queues;
+    int num_fuse_queues;
     FuseQueue *queues;
     /*
      * True if this export should follow the generic export's AioContext.
@@ -218,7 +212,8 @@ struct FuseExport {
     bool uring_started;
     size_t ring_queue_depth;
 
-    FuseRingQueueManager *ring_queue_manager;
+    int num_uring_queues;
+    FuseRingQueue *uring_queues;
 #endif
 
     mode_t st_mode;
@@ -277,7 +272,7 @@ static void fuse_attach_handlers(FuseExport *exp)
         return;
     }
 
-    for (size_t i = 0; i < exp->num_queues; i++) {
+    for (size_t i = 0; i < exp->num_fuse_queues; i++) {
         aio_set_fd_handler(exp->queues[i].ctx, exp->queues[i].fuse_fd,
                            read_from_fuse_fd, NULL, NULL, NULL,
                            &exp->queues[i]);
@@ -290,7 +285,7 @@ static void fuse_attach_handlers(FuseExport *exp)
  */
 static void fuse_detach_handlers(FuseExport *exp)
 {
-    for (int i = 0; i < exp->num_queues; i++) {
+    for (int i = 0; i < exp->num_fuse_queues; i++) {
         aio_set_fd_handler(exp->queues[i].ctx, exp->queues[i].fuse_fd,
                            NULL, NULL, NULL, NULL, NULL);
     }
@@ -309,7 +304,7 @@ static void fuse_export_drained_end(void *opaque)
     /* Refresh AioContext in case it changed */
     exp->common.ctx = blk_get_aio_context(exp->common.blk);
     if (exp->follow_aio_context) {
-        assert(exp->num_queues == 1);
+        assert(exp->num_fuse_queues == 1);
         exp->queues[0].ctx = exp->common.ctx;
     }
 
@@ -446,23 +441,24 @@ static void fuse_uring_submit_register(void *opaque)
 }
 
 /**
- * Distribute ring queues across FUSE queues using round-robin algorithm.
+ * Distribute ring queues across FUSE queues in the round-robin manner.
  * This ensures even distribution of kernel ring queues across user-specified
  * FUSE queues.
+ *
+ * num_uring_queues > num_fuse_queues: Each IOThread manages multiple ring
+ * queues (multi-queue mapping).
+ * num_uring_queues < num_fuse_queues: Excess IOThreads remain idle with no
+ * assigned ring queues.
  */
-static FuseRingQueueManager *
-fuse_ring_queue_manager_create(int num_fuse_queues, size_t ring_queue_depth,
-                               size_t bufsize)
+void fuse_uring_setup_queues(FuseExport *exp, size_t bufsize)
 {
-    int num_ring_queues = get_nprocs_conf();
-    FuseRingQueueManager *manager = g_new(FuseRingQueueManager, 1);
+    int num_uring_queues = get_nprocs_conf();
 
-    manager->ring_queues = g_new(FuseRingQueue, num_ring_queues);
-    manager->num_ring_queues = num_ring_queues;
-    manager->num_fuse_queues = num_fuse_queues;
+    exp->num_uring_queues = num_uring_queues;
+    exp->uring_queues = g_new(FuseRingQueue, num_uring_queues);
 
-    for (int i = 0; i < num_ring_queues; i++) {
-        FuseRingQueue *rq = &manager->ring_queues[i];
+    for (int i = 0; i < num_uring_queues; i++) {
+        FuseRingQueue *rq = &exp->uring_queues[i];
         rq->rqid = i;
         rq->ent = g_new(FuseRingEnt, ring_queue_depth);
 
@@ -483,27 +479,17 @@ fuse_ring_queue_manager_create(int num_fuse_queues, size_t ring_queue_depth,
 
             ent->fuse_cqe_handler.cb = fuse_uring_cqe_handler;
         }
-    }
 
-    return manager;
-}
-
-static void
-fuse_distribute_ring_queues(FuseExport *exp, FuseRingQueueManager *manager)
-{
-    for (int i = 0; i < manager->num_ring_queues; i++) {
-        FuseRingQueue *rq = &manager->ring_queues[i];
-
-        rq->q = &exp->queues[i % manager->num_fuse_queues];
+        /* Distribute ring queues across FUSE queues */
+        rq->q = &exp->queues[i % exp->num_fuse_queues];
         QLIST_INSERT_HEAD(&(rq->q->ring_queue_list), rq, next);
     }
 }
 
 static void
-fuse_schedule_ring_queue_registrations(FuseExport *exp,
-                                       FuseRingQueueManager *manager)
+fuse_schedule_ring_queue_registrations(FuseExport *exp)
 {
-    for (int i = 0; i < manager->num_fuse_queues; i++) {
+    for (int i = 0; i < exp->num_fuse_queues; i++) {
         FuseQueue *q = &exp->queues[i];
         FuseRingQueue *rq;
 
@@ -532,13 +518,9 @@ static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
                          + FUSE_BUFFER_HEADER_SIZE;
     }
 
-    exp->ring_queue_manager = fuse_ring_queue_manager_create(
-        exp->num_queues, exp->ring_queue_depth, bufsize);
+    fuse_uring_setup_queues(exp->num_fuse_queues, exp->ring_queue_depth, bufsize);
 
-    /* Distribute ring queues across FUSE queues using round-robin */
-    fuse_distribute_ring_queues(exp, exp->ring_queue_manager);
-
-    fuse_schedule_ring_queue_registrations(exp, exp->ring_queue_manager);
+    fuse_schedule_ring_queue_registrations(exp);
 }
 #endif /* CONFIG_LINUX_IO_URING */
 
@@ -557,7 +539,7 @@ static int fuse_export_create(BlockExport *blk_exp,
 
 #ifdef CONFIG_LINUX_IO_URING
     exp->is_uring = args->io_uring;
-    exp->ring_queue_depth = FUSE_DEFAULT_RING_QUEUE_DEPTH;
+    exp->ring_queue_depth = FUSE_DEFAULT_URING_QUEUE_DEPTH;
 #endif
 
     if (multithread) {
@@ -565,7 +547,7 @@ static int fuse_export_create(BlockExport *blk_exp,
         assert(mt_count >= 1);
 
         exp->follow_aio_context = false;
-        exp->num_queues = mt_count;
+        exp->num_fuse_queues = mt_count;
         exp->queues = g_new(FuseQueue, mt_count);
 
         for (size_t i = 0; i < mt_count; i++) {
@@ -584,7 +566,7 @@ static int fuse_export_create(BlockExport *blk_exp,
         assert(mt_count == 0);
 
         exp->follow_aio_context = true;
-        exp->num_queues = 1;
+        exp->num_fuse_queues = 1;
         exp->queues = g_new(FuseQueue, 1);
         exp->queues[0] = (FuseQueue) {
             .exp = exp,
@@ -681,7 +663,7 @@ static int fuse_export_create(BlockExport *blk_exp,
 
     g_hash_table_insert(exports, g_strdup(exp->mountpoint), NULL);
 
-    assert(exp->num_queues >= 1);
+    assert(exp->num_fuse_queues >= 1);
     exp->queues[0].fuse_fd = fuse_session_fd(exp->fuse_session);
     ret = qemu_fcntl_addfl(exp->queues[0].fuse_fd, O_NONBLOCK);
     if (ret < 0) {
@@ -689,7 +671,7 @@ static int fuse_export_create(BlockExport *blk_exp,
         goto fail;
     }
 
-    for (int i = 1; i < exp->num_queues; i++) {
+    for (int i = 1; i < exp->num_fuse_queues; i++) {
         int fd = clone_fuse_fd(exp->queues[0].fuse_fd, errp);
         if (fd < 0) {
             ret = fd;
@@ -896,35 +878,21 @@ static void read_from_fuse_fd(void *opaque)
 }
 
 #ifdef CONFIG_LINUX_IO_URING
-static void fuse_ring_queue_manager_destroy(FuseRingQueueManager *manager)
-{
-    if (!manager) {
-        return;
-    }
-
-    for (int i = 0; i < manager->num_ring_queues; i++) {
-        FuseRingQueue *rq = &manager->ring_queues[i];
-
-        for (int j = 0; j < FUSE_DEFAULT_RING_QUEUE_DEPTH; j++) {
-            g_free(rq->ent[j].req_payload);
-        }
-        g_free(rq->ent);
-    }
-
-    g_free(manager->ring_queues);
-    g_free(manager);
-}
-
 static void fuse_export_delete_uring(FuseExport *exp)
 {
     exp->is_uring = false;
     exp->uring_started = false;
 
-    /* Clean up ring queue manager */
-    if (exp->ring_queue_manager) {
-        fuse_ring_queue_manager_destroy(exp->ring_queue_manager);
-        exp->ring_queue_manager = NULL;
+    for (int i = 0; i < exp->num_uring_queues; i++) {
+        FuseRingQueue *rq = &exp->uring_queues[i];
+
+        for (int j = 0; j < FUSE_DEFAULT_URING_QUEUE_DEPTH; j++) {
+            g_free(rq->ent[j].req_payload);
+        }
+        g_free(rq->ent);
     }
+
+    g_free(exp->uring_queues);
 }
 #endif
 
@@ -946,7 +914,7 @@ static void fuse_export_shutdown(BlockExport *blk_exp)
 
 #ifdef CONFIG_LINUX_IO_URING
     if (exp->is_uring) {
-        for (size_t i = 0; i < exp->num_queues; i++) {
+        for (size_t i = 0; i < exp->num_fuse_queues; i++) {
             FuseQueue *q = &exp->queues[i];
 
             /* Queue 0's FD belongs to the FUSE session */
@@ -970,7 +938,7 @@ static void fuse_export_delete(BlockExport *blk_exp)
 {
     FuseExport *exp = container_of(blk_exp, FuseExport, common);
 
-    for (size_t i = 0; i < exp->num_queues; i++) {
+    for (size_t i = 0; i < exp->num_fuse_queues; i++) {
         FuseQueue *q = &exp->queues[i];
 
 #ifdef CONFIG_LINUX_IO_URING
@@ -1067,7 +1035,7 @@ fuse_co_init(FuseExport *exp, struct fuse_init_out *out,
             supported_flags |= FUSE_OVER_IO_URING;
         } else {
             exp->is_uring = false;
-            return -ENODEV;
+            // return -ENODEV;
         }
     }
 #endif
@@ -1746,9 +1714,15 @@ static void coroutine_fn fuse_co_process_request_common(
     void *op_out_buf = (void *)FUSE_OUT_OP_STRUCT_LEGACY(out_buf);
 
 #ifdef CONFIG_LINUX_IO_URING
+    bool uring_initially_enabled = false;
+
     if (opcode != FUSE_INIT && exp->is_uring) {
         op_in_buf = (void *)in_buf;
         op_out_buf = (void *)out_buf;
+    }
+
+    if (unlikely(opcode == FUSE_INIT)) {
+        uring_initially_enabled = exp->is_uring;
     }
 #endif
 
@@ -1897,8 +1871,12 @@ static void coroutine_fn fuse_co_process_request_common(
     }
 
 #ifdef CONFIG_LINUX_IO_URING
-    /* Handle FUSE initialization errors */
-    if (unlikely(opcode == FUSE_INIT && ret == -ENODEV)) {
+    /*
+     * Detect kernel uring support by checking state change during
+     * FUSE_INIT.
+     */
+    if (unlikely(opcode == FUSE_INIT && uring_initially_enabled &&
+            !exp->is_uring)) {
         error_report("System doesn't support FUSE-over-io_uring");
         fuse_export_halt(exp);
         return;
