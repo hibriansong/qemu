@@ -583,6 +583,12 @@ static int fuse_export_create(BlockExport *blk_exp,
     assert(blk_exp_args->type == BLOCK_EXPORT_TYPE_FUSE);
 
     exp->is_uring = args->io_uring;
+#ifndef CONFIG_LINUX_IO_URING
+    if (exp->is_uring) {
+        error_setg(errp, "FUSE-over-io_uring requires CONFIG_LINUX_IO_URING");
+        return -ENOTSUP;
+    }
+#endif
 #ifdef CONFIG_LINUX_IO_URING
     exp->ring_queue_depth = FUSE_DEFAULT_URING_QUEUE_DEPTH;
 #endif
