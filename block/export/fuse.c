@@ -73,10 +73,10 @@ typedef struct FuseQueue FuseQueue;
  * Each FuseRingEnt represents a FUSE request. It exposes two iovec entries for
  * communication between the kernel driver and the userspace server:
  *
- *  - The first iovec holds the request header (FUSE_BUFFER_HEADER_SIZE),
- *    containing metadata about the request.
+ * - The first iovec holds the request header (FUSE_BUFFER_HEADER_SIZE),
+ *   containing metadata about the request.
  *
- *  - The second iovec holds the payload, used for READ/WRITE operations.
+ * - The second iovec holds the payload, used for READ/WRITE operations.
  */
 #define FUSE_BUFFER_HEADER_SIZE 0x1000
 
@@ -2089,7 +2089,7 @@ fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, int ret,
 
     out_header->error  = ret < 0 ? ret : 0;
     out_header->unique = req_id;
-    /* out_header->len = ret > 0 ? ret : 0; */
+    /* out_header->len = ret > 0 ? ret : 0; */  // TODO
     ent_in_out->payload_sz = ret > 0 ? ret : 0;
 
     /* Commit and fetch a ring entry */
@@ -2117,6 +2117,7 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
         (struct fuse_in_header *)&rrh->in_out;
     uint32_t opcode = in_hdr->opcode;
     uint64_t req_id = in_hdr->unique;
+
     ent->req_commit_id = ent_in_out->commit_id;
 
     if (unlikely(ent->req_commit_id == 0)) {
