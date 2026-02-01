@@ -2089,7 +2089,7 @@ fuse_uring_send_response(FuseRingEnt *ent, uint32_t req_id, int ret,
 
     out_header->error  = ret < 0 ? ret : 0;
     out_header->unique = req_id;
-    /* out_header->len = ret > 0 ? ret : 0; */  // TODO
+    // out_header->len = ret > 0 ? ret : 0;  // TODO  -- 我们不使用iovec这里 所以不需要
     ent_in_out->payload_sz = ret > 0 ? ret : 0;
 
     /* Commit and fetch a ring entry */
