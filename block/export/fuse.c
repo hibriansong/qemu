@@ -94,6 +94,8 @@ typedef struct FuseRingEnt {
     void *req_payload;
     size_t req_payload_sz;
 
+	enum fuse_uring_cmd last_cmd;
+
     /* The vector passed to the kernel */
     struct iovec iov[2];
 
@@ -328,6 +330,7 @@ static const BlockDevOps fuse_export_blk_dev_ops = {
 
 #ifdef CONFIG_LINUX_IO_URING
 static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent);
+static void fuse_uring_resubmit(struct io_uring_sqe *sqe, void *opaque);
 
 /**
  * fuse_inc_in_flight() / fuse_dec_in_flight():
@@ -376,8 +379,8 @@ static void coroutine_fn co_fuse_uring_queue_handle_cqe(void *opaque)
 
 static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
 {
-    FuseRingEnt *ent = container_of(cqe_handler, FuseRingEnt, fuse_cqe_handler);
     Coroutine *co;
+    FuseRingEnt *ent = container_of(cqe_handler, FuseRingEnt, fuse_cqe_handler);
     FuseExport *exp = ent->rq->q->exp;
 
     if (unlikely(exp->halted)) {
@@ -387,9 +390,17 @@ static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
     int err = cqe_handler->cqe.res;
 
     if (unlikely(err != 0)) {
-        /* -ENOTCONN is ok on umount  */
-        if (err != -ENOTCONN) {
+        switch (err) {
+        case -EAGAIN:
+        case -EINTR:
+            aio_add_sqe(fuse_uring_resubmit, ent, &ent->fuse_cqe_handler);
+            break;
+        case -ENOTCONN:
+            /* Connection already gone */
+            break;
+        default:
             fuse_export_halt(exp);
+            break;
         }
 
         /* A ring entry returned */
@@ -431,12 +442,35 @@ static void fuse_uring_prep_sqe_register(struct io_uring_sqe *sqe, void *opaque)
     FuseRingEnt *ent = opaque;
     struct fuse_uring_cmd_req *req = (void *)&sqe->cmd[0];
 
-    fuse_uring_sqe_prepare(sqe, ent->rq->q, FUSE_IO_URING_CMD_REGISTER);
+    ent->last_cmd = FUSE_IO_URING_CMD_REGISTER;
+    fuse_uring_sqe_prepare(sqe, ent->rq->q, ent->last_cmd);
 
     sqe->addr = (uint64_t)(ent->iov);
     sqe->len = 2;
 
     fuse_uring_sqe_set_req_data(req, ent->rq->rqid, 0);
+}
+
+static void fuse_uring_resubmit(struct io_uring_sqe *sqe, void *opaque)
+{
+    FuseRingEnt *ent = opaque;
+    struct fuse_uring_cmd_req *req = (void *)&sqe->cmd[0];
+
+    fuse_uring_sqe_prepare(sqe, ent->rq->q, ent->last_cmd);
+
+    switch (ent->last_cmd) {
+	case FUSE_IO_URING_CMD_REGISTER:
+		sqe->addr = (uint64_t)(ent->iov);
+		sqe->len = 2;
+		fuse_uring_sqe_set_req_data(req,ent->rq->rqid, 0);
+		break;
+	case FUSE_IO_URING_CMD_COMMIT_AND_FETCH:
+		fuse_uring_sqe_set_req_data(req,ent->rq->rqid, ent->req_commit_id);
+		break;
+	default:
+		error_report("Unknown command type: %d\n", ent->last_cmd);
+		break;
+    }
 }
 
 static void fuse_uring_submit_register(void *opaque)
@@ -2055,7 +2089,7 @@ fuse_co_process_request(FuseQueue *q, void *spillover_buf)
         opcode = in_hdr->opcode;
         req_id = in_hdr->unique;
     }
-
+    // TODO q->request_buf的使用检查
     fuse_co_process_request_common(exp, opcode, req_id, q->request_buf,
         spillover_buf, out_buf, q->fuse_fd, send_response_legacy, q);
 }
@@ -2066,9 +2100,10 @@ static void fuse_uring_prep_sqe_commit(struct io_uring_sqe *sqe, void *opaque)
     FuseRingEnt *ent = opaque;
     struct fuse_uring_cmd_req *req = (void *)&sqe->cmd[0];
 
-    fuse_uring_sqe_prepare(sqe, ent->rq->q, FUSE_IO_URING_CMD_COMMIT_AND_FETCH);
-    fuse_uring_sqe_set_req_data(req, ent->rq->rqid,
-                                     ent->req_commit_id);
+    ent->last_cmd = FUSE_IO_URING_CMD_COMMIT_AND_FETCH;
+
+    fuse_uring_sqe_prepare(sqe, ent->rq->q, ent->last_cmd);
+    fuse_uring_sqe_set_req_data(req, ent->rq->rqid, ent->req_commit_id);
 }
 
 static void
