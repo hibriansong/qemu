@@ -329,7 +329,7 @@ static const BlockDevOps fuse_export_blk_dev_ops = {
 #ifdef CONFIG_LINUX_IO_URING
 static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent);
 
-/*
+/**
  * fuse_inc_in_flight() / fuse_dec_in_flight():
  * Wrap the lifecycle of FUSE requests being processed. This ensures the
  * block layer's drain operation waits for active requests to complete
@@ -386,7 +386,7 @@ static void fuse_uring_cqe_handler(CqeHandler *cqe_handler)
 
     int err = cqe_handler->cqe.res;
 
-    if (err != 0) {
+    if (unlikely(err != 0)) {
         /* -ENOTCONN is ok on umount  */
         if (err != -ENOTCONN) {
             fuse_export_halt(exp);
@@ -532,7 +532,6 @@ static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
     }
 
     fuse_uring_setup_queues(exp, bufsize);
-
     fuse_schedule_ring_queue_registrations(exp);
 }
 #endif /* CONFIG_LINUX_IO_URING */
@@ -869,7 +868,7 @@ static void coroutine_fn co_read_from_fuse_fd(void *opaque)
     }
 
     fuse_co_process_request(q, spillover_buf);
-    qemu_vfree(spillover_buf);   // TODO
+    qemu_vfree(spillover_buf);
 
 no_request:
     fuse_dec_in_flight(exp);
@@ -1713,7 +1712,9 @@ static int fuse_write_buf_response(int fd, uint32_t req_id,
             (const struct fuse_##op_name##_in *)(__in_hdr + 1); \
         const size_t __param_len = sizeof(*__in_hdr) + sizeof(*__in); \
         \
-        QEMU_BUILD_BUG_ON(sizeof((queue)->request_buf) < __param_len); \
+        QEMU_BUILD_BUG_ON(sizeof((queue)->request_buf) < \
+                          (sizeof(struct fuse_in_header) + \
+                           sizeof(struct fuse_##op_name##_in))); \
         \
         uint32_t __req_len = __in_hdr->len; \
         if (__req_len < __param_len) { \
@@ -1745,7 +1746,7 @@ static int fuse_write_buf_response(int fd, uint32_t req_id,
         __out; \
     })
 
-/*
+/**
  * Shared helper for FUSE request processing. Handles both legacy and io_uring
  * paths.
  */
@@ -1764,12 +1765,18 @@ static void coroutine_fn fuse_co_process_request_common(
     void *out_data_buffer = NULL;
     int ret = 0;
 
-/* TODO 解释初始化， 结束FUSEUring初始化必须通过FUSE INIT; 如果想开uring但没开成功，直接abort（与libfuse不一样）*/
+#ifdef CONFIG_LINUX_IO_URING
+    /*
+     * Enable FUSE-over-io_uring mode if supported.
+     * FUSE_INIT is only handled in legacy mode.
+     * Failure returns -EOPNOTSUPP; success switches to io_uring path.
+     */
     bool uring_initially_enabled = false;
 
     if (unlikely(opcode == FUSE_INIT)) {
         uring_initially_enabled = exp->is_uring;
     }
+#endif
 
     switch (opcode) {
     case FUSE_INIT: {
@@ -1974,17 +1981,17 @@ static void coroutine_fn fuse_co_process_request_common(
     if (unlikely(opcode == FUSE_INIT) && uring_initially_enabled) {
         if (exp->is_uring && fd != -1) {
             /*
-            * Handle FUSE-over-io_uring initialization: if uring is enabled
-            * and we are on the legacy path (fd != -1), start uring now.
-            */
+             * Handle FUSE-over-io_uring initialization: if uring is enabled
+             * and we are on the legacy path (fd != -1), start uring now.
+             */
             struct fuse_init_out *out =
                 FUSE_OUT_OP_STRUCT_LEGACY(init, out_buf);
             fuse_uring_start(exp, out);
         } else if (ret == -EOPNOTSUPP) {
             /*
-            * If we requested uring but kernel doesn't support it,
-            * halt the export.
-            */
+             * If we requested uring but kernel doesn't support it,
+             * halt the export.
+             */
             error_report("System doesn't support FUSE-over-io_uring");
             fuse_export_halt(exp);
         }
@@ -2122,7 +2129,7 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
     fuse_co_process_request_common(exp, opcode, req_id, &rrh->op_in,
         NULL, ent->req_payload, -1, send_response_uring, ent);
 }
-#endif
+#endif /* CONFIG_LINUX_IO_URING */
 
 const BlockExportDriver blk_exp_fuse = {
     .type               = BLOCK_EXPORT_TYPE_FUSE,
