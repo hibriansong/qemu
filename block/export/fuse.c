@@ -582,8 +582,8 @@ static int fuse_export_create(BlockExport *blk_exp,
 
     assert(blk_exp_args->type == BLOCK_EXPORT_TYPE_FUSE);
 
-#ifdef CONFIG_LINUX_IO_URING
     exp->is_uring = args->io_uring;
+#ifdef CONFIG_LINUX_IO_URING
     exp->ring_queue_depth = FUSE_DEFAULT_URING_QUEUE_DEPTH;
 #endif
 
@@ -2013,15 +2013,16 @@ static void coroutine_fn fuse_co_process_request_common(
     if (unlikely(opcode == FUSE_INIT) && uring_initially_enabled) {
         if (exp->is_uring && !exp->uring_started) {
             /*
-             * Handle FUSE-over-io_uring initialization: if uring is enabled
-             * and we are on the legacy path, start uring now.
+             * Handle FUSE-over-io_uring initialization.
+             * If io_uring mode was requested for this export but it has not
+             * been started yet, start it now.
              */
             struct fuse_init_out *out =
                 FUSE_OUT_OP_STRUCT_LEGACY(init, out_buf);
             fuse_uring_start(exp, out);
         } else if (ret == -EOPNOTSUPP) {
             /*
-             * If we requested uring but kernel doesn't support it,
+             * If io_uring was requested but the kernel does not support it,
              * halt the export.
              */
             error_report("System doesn't support FUSE-over-io_uring");
