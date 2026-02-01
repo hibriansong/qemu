@@ -209,11 +209,11 @@ struct FuseExport {
     /* Whether allow_other was used as a mount option or not */
     bool allow_other;
 
-#ifdef CONFIG_LINUX_IO_URING
     /* Indicates whether to enable FUSE-over-io_uring */
     bool is_uring;
-
     bool uring_started;
+
+#ifdef CONFIG_LINUX_IO_URING
     size_t ring_queue_depth;
 
     int num_uring_queues;
@@ -549,7 +549,6 @@ fuse_schedule_ring_queue_registrations(FuseExport *exp)
 static void fuse_uring_start(FuseExport *exp, struct fuse_init_out *out)
 {
     assert(!exp->uring_started);
-
     exp->uring_started = true;
 
     /*
@@ -1733,7 +1732,7 @@ static int fuse_write_buf_response(int fd, uint32_t req_id,
  * in_buf, which is assumed to hold a fuse_in_header first).
  * Verifies that the object is complete (in_buf is large enough to hold it in
  * one piece, and the request length includes the whole object).
- * Only performs verification for legacy FUSE (fd != -1).
+ * Only performs verification for legacy FUSE.
  *
  * Note that queue->request_buf may be overwritten after yielding, so the
  * returned pointer must not be used across a function that may yield!
@@ -1764,7 +1763,7 @@ static int fuse_write_buf_response(int fd, uint32_t req_id,
  * For use in fuse_co_process_request_common():
  * Returns a pointer to the return object for the given operation (inside of
  * out_buf, which is assumed to hold a fuse_out_header first).
- * Only performs verification for legacy FUSE (fd != -1).
+ * Only performs verification for legacy FUSE.
  * Note: Buffer size verification is done via static assertions in the caller
  * (fuse_co_process_request) where out_buf is a local array.
  *
@@ -1791,7 +1790,6 @@ static void coroutine_fn fuse_co_process_request_common(
     void *in_buf,
     void *spillover_buf,
     void *out_buf,
-    int fd, /* -1 for uring */
     void (*send_response)(void *opaque, uint32_t req_id, int ret,
                          const void *buf, void *out_buf),
     void *opaque /* FuseQueue* or FuseRingEnt* */)
@@ -1815,12 +1813,12 @@ static void coroutine_fn fuse_co_process_request_common(
     switch (opcode) {
     case FUSE_INIT: {
         FuseQueue *q = opaque;
-        const struct fuse_init_in *in
-            = FUSE_IN_OP_STRUCT_LEGACY(init, q);
+        const struct fuse_init_in *in =
+            FUSE_IN_OP_STRUCT_LEGACY(init, q);
         if (!in) break;
 
-        struct fuse_init_out *out
-            = FUSE_OUT_OP_STRUCT_LEGACY(init, out_buf);
+        struct fuse_init_out *out =
+            FUSE_OUT_OP_STRUCT_LEGACY(init, out_buf);
 
         ret = fuse_co_init(exp, out, in->max_readahead, in);
         break;
@@ -1829,10 +1827,10 @@ static void coroutine_fn fuse_co_process_request_common(
     case FUSE_OPEN: {
         struct fuse_open_out *out;
 
-        if (fd != -1) {
-            out = FUSE_OUT_OP_STRUCT_LEGACY(open, out_buf);
-        } else {
+        if (exp->uring_started) {
             out = out_buf;
+        } else {
+            out = FUSE_OUT_OP_STRUCT_LEGACY(open, out_buf);
         }
 
         ret = fuse_co_open(exp, out);
@@ -1850,10 +1848,10 @@ static void coroutine_fn fuse_co_process_request_common(
     case FUSE_GETATTR: {
         struct fuse_attr_out *out;
 
-        if (fd != -1) {
-            out = FUSE_OUT_OP_STRUCT_LEGACY(attr, out_buf);
-        } else {
+        if (exp->uring_started) {
             out = out_buf;
+        } else {
+            out = FUSE_OUT_OP_STRUCT_LEGACY(attr, out_buf);
         }
 
         ret = fuse_co_getattr(exp, out);
@@ -1864,15 +1862,15 @@ static void coroutine_fn fuse_co_process_request_common(
         const struct fuse_setattr_in *in;
         struct fuse_attr_out *out;
 
-        if (fd != -1) {
+        if (exp->uring_started) {
+            in = in_buf;
+            out = out_buf;
+        } else {
             FuseQueue *q = opaque;
             in = FUSE_IN_OP_STRUCT_LEGACY(setattr, q);
             if (!in) break;
 
             out = FUSE_OUT_OP_STRUCT_LEGACY(attr, out_buf);
-        } else {
-            in = in_buf;
-            out = out_buf;
         }
 
         ret = fuse_co_setattr(exp, out, in->valid, in->size, in->mode,
@@ -1883,12 +1881,12 @@ static void coroutine_fn fuse_co_process_request_common(
     case FUSE_READ: {
         const struct fuse_read_in *in;
 
-        if (fd != -1) {
+        if (exp->uring_started) {
+            in = in_buf;
+        } else {
             FuseQueue *q = opaque;
             in = FUSE_IN_OP_STRUCT_LEGACY(read, q);
             if (!in) break;
-        } else {
-            in = in_buf;
         }
 
         ret = fuse_co_read(exp, &out_data_buffer, in->offset, in->size);
@@ -1901,7 +1899,20 @@ static void coroutine_fn fuse_co_process_request_common(
         const void *in_place_buf;
         const void *spill_buf;
 
-        if (fd != -1) {
+        if (exp->uring_started) {
+            in = in_buf;
+            out = out_buf;
+
+            assert(in->size <=
+                ((FuseRingEnt *)opaque)->req_header.ring_ent_in_out.payload_sz);
+
+            /*
+             * In uring mode, the "out_buf" (ent->payload) actually holds the
+             * input data for WRITE requests.
+             */
+            in_place_buf = NULL;
+            spill_buf = out_buf;
+        } else {
             FuseQueue *q = opaque;
             in = FUSE_IN_OP_STRUCT_LEGACY(write, q);
             if (!in) break;
@@ -1925,19 +1936,6 @@ static void coroutine_fn fuse_co_process_request_common(
             /* Legacy buffer setup */
             in_place_buf = in + 1;
             spill_buf = spillover_buf;
-        } else {
-            in = in_buf;
-            out = out_buf;
-
-            assert(in->size <=
-                ((FuseRingEnt *)opaque)->req_header.ring_ent_in_out.payload_sz);
-
-            /*
-             * In uring mode, the "out_buf" (ent->payload) actually holds the
-             * input data for WRITE requests.
-             */
-            in_place_buf = NULL;
-            spill_buf = out_buf;
         }
         /*
          * poll_fuse_fd() has checked that in_hdr->len matches the number of
@@ -1960,12 +1958,12 @@ static void coroutine_fn fuse_co_process_request_common(
     case FUSE_FALLOCATE: {
         const struct fuse_fallocate_in *in;
 
-        if (fd != -1) {
+        if (exp->uring_started) {
+            in = in_buf;
+        } else {
             FuseQueue *q = opaque;
             in = FUSE_IN_OP_STRUCT_LEGACY(fallocate, q);
             if (!in) break;
-        } else {
-            in = in_buf;
         }
 
         ret = fuse_co_fallocate(exp, in->offset, in->length, in->mode);
@@ -1985,15 +1983,15 @@ static void coroutine_fn fuse_co_process_request_common(
         const struct fuse_lseek_in *in;
         struct fuse_lseek_out *out;
 
-        if (fd != -1) {
+        if (exp->uring_started) {
+            in = in_buf;
+            out = out_buf;
+        } else {
             FuseQueue *q = opaque;
             in = FUSE_IN_OP_STRUCT_LEGACY(lseek, q);
             if (!in) break;
 
             out = FUSE_OUT_OP_STRUCT_LEGACY(lseek, out_buf);
-        } else {
-            in = in_buf;
-            out = out_buf;
         }
 
         ret = fuse_co_lseek(exp, out, in->offset, in->whence);
@@ -2013,10 +2011,10 @@ static void coroutine_fn fuse_co_process_request_common(
 
 #ifdef CONFIG_LINUX_IO_URING
     if (unlikely(opcode == FUSE_INIT) && uring_initially_enabled) {
-        if (exp->is_uring && fd != -1) {
+        if (exp->is_uring && !exp->uring_started) {
             /*
              * Handle FUSE-over-io_uring initialization: if uring is enabled
-             * and we are on the legacy path (fd != -1), start uring now.
+             * and we are on the legacy path, start uring now.
              */
             struct fuse_init_out *out =
                 FUSE_OUT_OP_STRUCT_LEGACY(init, out_buf);
@@ -2089,9 +2087,9 @@ fuse_co_process_request(FuseQueue *q, void *spillover_buf)
         opcode = in_hdr->opcode;
         req_id = in_hdr->unique;
     }
-    // TODO q->request_buf的使用检查
-    fuse_co_process_request_common(exp, opcode, req_id, q->request_buf,
-        spillover_buf, out_buf, q->fuse_fd, send_response_legacy, q);
+
+    fuse_co_process_request_common(exp, opcode, req_id, NULL,
+        spillover_buf, out_buf, send_response_legacy, q);
 }
 
 #ifdef CONFIG_LINUX_IO_URING
@@ -2162,7 +2160,7 @@ static void coroutine_fn fuse_uring_co_process_request(FuseRingEnt *ent)
     }
 
     fuse_co_process_request_common(exp, opcode, req_id, &rrh->op_in,
-        NULL, ent->req_payload, -1, send_response_uring, ent);
+        NULL, ent->req_payload, send_response_uring, ent);
 }
 #endif /* CONFIG_LINUX_IO_URING */
 
