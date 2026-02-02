@@ -2,6 +2,7 @@
  * Present a block device as a raw image through FUSE
  *
  * Copyright (c) 2020, 2025 Hanna Czenczek <hreitz@redhat.com>
+ * Copyright (c) 2025, 2026 Brian Song <hibriansong@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -950,6 +951,38 @@ static void fuse_export_delete_uring(FuseExport *exp)
 }
 #endif
 
+/**
+ * The Linux kernel currently lacks support for asynchronous cancellation
+ * of FUSE-over-io_uring SQEs. This can lead to a race where an IOThread may
+ * access fuse_fd after it is closed but before pending SQEs are canceled,
+ * potentially operating on a newly reused file descriptor.
+ *
+ * Therefore, schedule a BH in the IOThread to close and invalidate fuse_fd,
+ * to avoid races on fuse_fd.
+ */
+#ifdef CONFIG_LINUX_IO_URING
+static void close_fuse_fd(void *opaque)
+{
+    FuseQueue *q = opaque;
+
+    if (q->fuse_fd >= 0) {
+        close(q->fuse_fd);
+        q->fuse_fd = -1;
+    }
+}
+#endif
+
+/**
+ * During exit in FUSE-over-io_uring mode, qemu-storage-daemon requests
+ * shutdown in main() and then immediately tears down the block export.
+ * However, SQEs already submitted under FUSE-over-io_uring may still complete
+ * and generate CQEs that continue to hold references to the block export,
+ * preventing it from being freed cleanly.
+ *
+ * Since the Linux kernel currently lacks support for asynchronous cancellation
+ * of FUSE-over-io_uring SQEs, this function aborts the connection and cancels
+ * all pending SQEs to ensure a safe teardown.
+ */
 static void fuse_export_shutdown(BlockExport *blk_exp)
 {
     FuseExport *exp = container_of(blk_exp, FuseExport, common);
@@ -972,11 +1005,12 @@ static void fuse_export_shutdown(BlockExport *blk_exp)
             FuseQueue *q = &exp->queues[i];
 
             /* Queue 0's FD belongs to the FUSE session */
-            if (i > 0 && q->fuse_fd >= 0) {
-                close(q->fuse_fd);
+            if (i > 0) {
+                aio_bh_schedule_oneshot(q->ctx, close_fuse_fd, q);
             }
         }
 
+        /* To cancel all pending SQEs */
         if (exp->fuse_session) {
             if (exp->mounted) {
                 fuse_session_unmount(exp->fuse_session);
@@ -995,27 +1029,23 @@ static void fuse_export_delete(BlockExport *blk_exp)
     for (size_t i = 0; i < exp->num_fuse_queues; i++) {
         FuseQueue *q = &exp->queues[i];
 
-#ifdef CONFIG_LINUX_IO_URING
         if (!exp->uring_started) {
-#endif
             /* Queue 0's FD belongs to the FUSE session */
             if (i > 0 && q->fuse_fd >= 0) {
                 close(q->fuse_fd);
             }
-#ifdef CONFIG_LINUX_IO_URING
         }
-#endif
         if (q->spillover_buf) {
             qemu_vfree(q->spillover_buf);
         }
     }
     g_free(exp->queues);
 
-#ifdef CONFIG_LINUX_IO_URING
     if (exp->uring_started) {
+#ifdef CONFIG_LINUX_IO_URING
         fuse_export_delete_uring(exp);
-    } else {
 #endif
+    } else {
         if (exp->fuse_session) {
             if (exp->mounted) {
                 fuse_session_unmount(exp->fuse_session);
@@ -1024,9 +1054,7 @@ static void fuse_export_delete(BlockExport *blk_exp)
         }
 
         g_free(exp->mountpoint);
-#ifdef CONFIG_LINUX_IO_URING
     }
-#endif
 }
 
 /**
