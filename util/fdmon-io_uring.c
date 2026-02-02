@@ -455,6 +455,8 @@ void fdmon_io_uring_setup(AioContext *ctx, Error **errp)
     int flags;
 
     ctx->io_uring_fd_tag = NULL;
+
+    /* Needed by FUSE-over-io_uring */
     flags = IORING_SETUP_SQE128;
 
     ret = io_uring_queue_init(FDMON_IO_URING_ENTRIES,
