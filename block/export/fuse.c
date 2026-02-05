@@ -934,6 +934,57 @@ static void read_from_fuse_fd(void *opaque)
     qemu_coroutine_enter(co);
 }
 
+#ifdef CONFIG_LINUX_IO_URING
+static void fuse_export_delete_uring(FuseExport *exp)
+{
+    exp->is_uring = false;
+    exp->uring_started = false;
+
+    for (int i = 0; i < exp->num_uring_queues; i++) {
+        FuseUringQueue *rq = &exp->uring_queues[i];
+
+        for (int j = 0; j < FUSE_DEFAULT_URING_QUEUE_DEPTH; j++) {
+            g_free(rq->ent[j].req_payload);
+        }
+        g_free(rq->ent);
+    }
+
+    g_free(exp->uring_queues);
+}
+#endif
+
+/**
+ * The Linux kernel currently lacks support for asynchronous cancellation
+ * of FUSE-over-io_uring SQEs. This can lead to a race where an IOThread may
+ * access fuse_fd after it is closed but before pending SQEs are canceled,
+ * potentially operating on a newly reused file descriptor.
+ *
+ * Therefore, schedule a BH in the IOThread to close and invalidate fuse_fd,
+ * to avoid races on fuse_fd.
+ */
+#ifdef CONFIG_LINUX_IO_URING
+static void close_fuse_fd(void *opaque)
+{
+    FuseQueue *q = opaque;
+
+    if (q->fuse_fd >= 0) {
+        close(q->fuse_fd);
+        q->fuse_fd = -1;
+    }
+}
+#endif
+
+/**
+ * During exit in FUSE-over-io_uring mode, qemu-storage-daemon requests
+ * shutdown in main() and then immediately tears down the block export.
+ * However, SQEs already submitted under FUSE-over-io_uring may still complete
+ * and generate CQEs that continue to hold references to the block export,
+ * preventing it from being freed cleanly.
+ *
+ * Since the Linux kernel currently lacks support for asynchronous cancellation
+ * of FUSE-over-io_uring SQEs, this function aborts the connection and cancels
+ * all pending SQEs to ensure a safe teardown.
+ */
 static void fuse_export_shutdown(BlockExport *blk_exp)
 {
     FuseExport *exp = container_of(blk_exp, FuseExport, common);
@@ -949,18 +1000,42 @@ static void fuse_export_shutdown(BlockExport *blk_exp)
          */
         g_hash_table_remove(exports, exp->mountpoint);
     }
+
+#ifdef CONFIG_LINUX_IO_URING
+    if (exp->uring_started) {
+        for (size_t i = 0; i < exp->num_fuse_queues; i++) {
+            FuseQueue *q = &exp->queues[i];
+
+            /* Queue 0's FD belongs to the FUSE session */
+            if (i > 0) {
+                aio_bh_schedule_oneshot(q->ctx, close_fuse_fd, q);
+            }
+        }
+
+        /* To cancel all pending SQEs */
+        if (exp->fuse_session) {
+            if (exp->mounted) {
+                fuse_session_unmount(exp->fuse_session);
+            }
+            fuse_session_destroy(exp->fuse_session);
+        }
+        g_free(exp->mountpoint);
+    }
+#endif
 }
 
 static void fuse_export_delete(BlockExport *blk_exp)
 {
     FuseExport *exp = container_of(blk_exp, FuseExport, common);
 
-    for (int i = 0; i < exp->num_fuse_queues; i++) {
+    for (size_t i = 0; i < exp->num_fuse_queues; i++) {
         FuseQueue *q = &exp->queues[i];
 
-        /* Queue 0's FD belongs to the FUSE session */
-        if (i > 0 && q->fuse_fd >= 0) {
-            close(q->fuse_fd);
+        if (!exp->uring_started) {
+            /* Queue 0's FD belongs to the FUSE session */
+            if (i > 0 && q->fuse_fd >= 0) {
+                close(q->fuse_fd);
+            }
         }
         if (q->spillover_buf) {
             qemu_vfree(q->spillover_buf);
@@ -968,15 +1043,20 @@ static void fuse_export_delete(BlockExport *blk_exp)
     }
     g_free(exp->queues);
 
-    if (exp->fuse_session) {
-        if (exp->mounted) {
-            fuse_session_unmount(exp->fuse_session);
+    if (exp->uring_started) {
+#ifdef CONFIG_LINUX_IO_URING
+        fuse_export_delete_uring(exp);
+#endif
+    } else {
+        if (exp->fuse_session) {
+            if (exp->mounted) {
+                fuse_session_unmount(exp->fuse_session);
+            }
+            fuse_session_destroy(exp->fuse_session);
         }
 
-        fuse_session_destroy(exp->fuse_session);
+        g_free(exp->mountpoint);
     }
-
-    g_free(exp->mountpoint);
 }
 
 /**
