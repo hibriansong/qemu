@@ -546,10 +546,37 @@ _make_test_img()
         # iotests.  The default allow-other=auto has the downside of printing a
         # fusermount error on its first attempt if allow_other is not
         # permissible, which we would need to filter.
-        QSD_NEED_PID=y $QSD \
-              --blockdev file,node-name=export-node,filename=$img_name,discard=unmap \
-              --export fuse,id=fuse-export,node-name=export-node,mountpoint="$export_mp",writable=on,growable=on,allow-other=off \
-              &
+        if [ -n "$FUSE_OVER_IO_URING" ]; then
+            # The current Linux kernel requires registering `nr_cpu` Ring Queues
+            # when FUSE-over-io_uring is enabled. Here, we set half of the
+            # Ring Queues to FUSE Queues (`nr_iothreads`) to test the queue
+            # distribution feature.
+            # See the comments in fuse.c regarding the round-robin distribution
+            # between Ring Queues and FUSE Queues.
+            nr_cpu=$(nproc 2>/dev/null || echo 1)
+            nr_iothreads=$((nr_cpu / 2))
+            if [ $nr_iothreads -lt 1 ]; then
+                nr_iothreads=1
+            fi
+
+            iothread_args=""
+            iothread_export_args=""
+            for ((i=0; i<$nr_iothreads; i++)); do
+                iothread_args="$iothread_args --object iothread,id=iothread$i"
+                iothread_export_args="$iothread_export_args,iothread.$i=iothread$i"
+            done
+
+            QSD_NEED_PID=y $QSD \
+                    $iothread_args \
+                    --blockdev file,node-name=export-node,filename=$img_name,discard=unmap \
+                    --export fuse,id=fuse-export,node-name=export-node,mountpoint="$export_mp",writable=on,growable=on,allow-other=off,io-uring=on$iothread_export_args \
+                &
+        else
+            QSD_NEED_PID=y $QSD \
+                --blockdev file,node-name=export-node,filename=$img_name,discard=unmap \
+                --export fuse,id=fuse-export,node-name=export-node,mountpoint="$export_mp",writable=on,growable=on,allow-other=off \
+                &
+        fi
 
         pidfile="$QEMU_TEST_DIR/qemu-storage-daemon.pid"
 
@@ -595,16 +622,8 @@ _rm_test_img()
         # Wait until the mount is gone
         timeout=10 # *0.5 s
         while true; do
-            # Will show the mount point; if the mount is still there,
-            # it will be $img.
-            df_output=$(df "$img" 2>/dev/null)
-
-            # But df may also show an error ("Transpoint endpoint not
-            # connected"), so retry in such cases
-            if [ -n "$df_output" ]; then
-                if ! echo "$df_output" | grep -q "$img"; then
-                    break
-                fi
+            if ! mount | grep -q "$img"; then
+                break
             fi
 
             sleep 0.5
