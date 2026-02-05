@@ -452,10 +452,15 @@ static const FDMonOps fdmon_io_uring_ops = {
 void fdmon_io_uring_setup(AioContext *ctx, Error **errp)
 {
     int ret;
+    int flags;
 
     ctx->io_uring_fd_tag = NULL;
 
-    ret = io_uring_queue_init(FDMON_IO_URING_ENTRIES, &ctx->fdmon_io_uring, 0);
+    /* Needed by FUSE-over-io_uring */
+    flags = IORING_SETUP_SQE128;
+
+    ret = io_uring_queue_init(FDMON_IO_URING_ENTRIES,
+                              &ctx->fdmon_io_uring, flags);
     if (ret != 0) {
         error_setg_errno(errp, -ret, "Failed to initialize io_uring");
         return;
